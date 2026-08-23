@@ -28,7 +28,6 @@ const {
 const {
   getUser,
   createUser,
-  applyPayment,
   addGameResult,
   applySpin,
   createSession,
@@ -39,9 +38,13 @@ const {
   deleteExpiredSessions,
   addHistoryEntry,
   getHistory,
-  // Идемпотентность платежей (этап 2)
+  // Платежи: идемпотентность (этап 2) и атомарное начисление
+  // с журналом в одной транзакции (этап 3)
   isEventProcessed,
-  markEventProcessed,
+  processPayment,
+  isUniqueConstraintError,
+  // Контроль целостности балансов при старте (этап 3)
+  countNegativeBalances,
 } = require("./db");
 // Хеширование и проверка паролей (этап 1)
 const {
@@ -143,7 +146,13 @@ const ERROR_RESULTS = new Set([
 
 // Пользователи, сессии, история, платежи и журнал админ-действий
 // хранятся в SQLite — см. ./db (этап 0); пароли — только bcrypt-хеши
-// (этап 1, см. ./auth)
+// (этап 1, см. ./auth).
+//
+// БАЛАНС (этап 3): меняется ТОЛЬКО на сервере и только тремя путями —
+// processPayment (переводы из Minecraft), applySpin (слоты) и
+// adjustBalance (будущие админ-операции). Ни один клиентский запрос
+// не принимает значение баланса из тела; минус невозможен благодаря
+// CHECK-ограничению схемы и условиям внутри UPDATE
 
 // Допустимые сложности ботов
 const ALLOWED_DIFFICULTIES = ["easy", "medium", "hard"];
@@ -791,7 +800,7 @@ wss.on("connection", (ws, req) => {
 
 // ===== REST API =====
 
-// Приём переводов из Minecraft (этап 2).
+// Приём переводов из Minecraft (этапы 2–3).
 //
 // Формат запроса от Fabric-считывателя:
 //   POST /api/minecraft/payment
@@ -807,10 +816,13 @@ wss.on("connection", (ws, req) => {
 //       "eventId": "уникальный"   // ОБЯЗАТЕЛЕН, уникален для каждого перевода
 //     }
 //
-// Идемпотентность: если eventId уже обрабатывался, деньги НЕ начисляются
-// повторно — возвращается ok: true и duplicate: true с текущим балансом.
-// Это защищает от повторной доставки сообщения считывателем (ретраи,
-// перезапуски плагина, дубли в очереди и т.п.).
+// Идемпотентность (два барьера, этапы 2–3):
+//   1. Предварительная проверка isEventProcessed(eventId) — дубликат
+//      отсекается до каких-либо изменений;
+//   2. PRIMARY KEY таблицы payments: начисление и журнальная запись
+//      выполняются ОДНОЙ транзакцией (processPayment), поэтому падение
+//      процесса между ними больше не оставляет окно для повторного
+//      зачисления, а теоретическая гонка отсекается самой БД.
 //
 // Пароль аккаунта генерируется здесь и показывается игроку РОВНО ОДИН
 // раз — при создании. В БД попадает только bcrypt-хеш, восстановить
@@ -862,10 +874,10 @@ app.post("/api/minecraft/payment", (req, res) => {
 
   // --- Шаг 4. Идемпотентность: повторный перевод не зачисляется дважды ---
   //
-  // Проверка и последующая отметка выполняются синхронно, без await
+  // Проверка и последующая транзакция выполняются синхронно, без await
   // между ними: Node однопоточен, поэтому два одинаковых запроса
-  // физически не могут одновременно пройти проверку до вставки —
-  // гонки нет, отдельная транзакция не требуется.
+  // физически не могут одновременно пройти проверку до вставки.
+  // Второй барьер — ограничение БД (см. шаг 5)
   if (isEventProcessed(eventId)) {
     const existing = getUser(nickname);
 
@@ -898,19 +910,44 @@ app.post("/api/minecraft/payment", (req, res) => {
     });
   }
 
-  // Начисление одной атомарной операцией в БД
-  applyPayment(user.nickname, parsedAmount);
+  // --- Шаг 5. Начисление + журнал платежа — ОДНА атомарная транзакция ---
+  //
+  // Деньги и журнальная запись применяются только вместе (этап 3):
+  // крах процесса посередине больше не оставляет возможность
+  // зачислить тот же перевод повторно после рестарта
+  try {
+    processPayment({
+      nickname: user.nickname,
+      amount: parsedAmount,
+      eventId,
+      currency,
+      rawMessage,
+    });
+  } catch (err) {
+    // Страховка идемпотентности на уровне БД: если одинаковый eventId
+    // всё же пробился мимо проверки выше (теоретическая гонка),
+    // PRIMARY KEY таблицы payments отклонит повторную вставку —
+    // отвечаем как для дубликата, деньги не трогаем
+    if (isUniqueConstraintError(err)) {
+      const existing = getUser(nickname);
 
-  // Журнал платежей: каждый ПРИНЯТЫЙ перевод фиксируется в таблице
-  // payments вместе с исходным текстом чата — по нему можно разбирать
-  // спорные случаи («перевод был, а баланса нет»)
-  markEventProcessed({
-    eventId,
-    nickname: user.nickname,
-    amount: parsedAmount,
-    currency,
-    rawMessage,
-  });
+      console.log("[PAYMENT] Дубликат отклонён ограничением БД:", { eventId, nickname });
+
+      return res.json({
+        ok: true,
+        duplicate: true,
+        created: false,
+        nickname: existing ? existing.nickname : nickname,
+        balance: existing ? existing.balance : 0,
+        password: null,
+        tellMessage: null,
+      });
+    }
+
+    // Любая другая ошибка — реальная проблема (диск, повреждение базы),
+    // её нельзя маскировать под дубликат: пробрасываем дальше
+    throw err;
+  }
 
   // Перечитываем актуальные баланс и данные
   user = getUser(nickname);
@@ -1420,7 +1457,8 @@ app.get("/api/lobby/my-table", (req, res) => {
 });
 
 // Прокрутка слотов. Баланс меняет только сервер одной операцией;
-// статистика wins/losses/gamesPlayed слотами НЕ затрагивается
+// статистика wins/losses/gamesPlayed слотами НЕ затрагивается.
+// Гонки быстрых кликов исключены атомарностью UPDATE (этап 3)
 app.post("/api/slots/spin", (req, res) => {
   const nickname = req.sessionNickname;
 
@@ -1505,6 +1543,7 @@ app.post("/api/slots/spin", (req, res) => {
 
 // Результат завершённой ЛОКАЛЬНОЙ игры (fallback-режим клиента УНО).
 // Сетевые партии сервер записывает сам в recordResults().
+// На баланс этот эндпоинт НЕ влияет — только статистика (этап 3)
 app.post("/api/game/result", (req, res) => {
   const nickname = req.sessionNickname;
 
@@ -1631,6 +1670,21 @@ setInterval(() => {
 // фоновая чистка лишь не даёт таблице sessions распухать
 deleteExpiredSessions();
 setInterval(deleteExpiredSessions, 60 * 60 * 1000);
+
+// Контроль целостности балансов при старте (этап 3). CHECK-ограничение
+// схемы делает отрицательный баланс невозможным; эта проверка —
+// страховка от повреждения файла базы внешними инструментами
+{
+  const negatives = countNegativeBalances();
+
+  if (negatives > 0) {
+    console.warn(
+      `[DB] ВНИМАНИЕ: ${negatives} польз. с отрицательным балансом — база изменена извне?`
+    );
+  } else {
+    console.log("[DB] Целостность балансов в порядке");
+  }
+}
 
 server.listen(PORT, () => {
   console.log(`Mock server running on http://localhost:${PORT}`);

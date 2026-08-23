@@ -1,4 +1,4 @@
-// Слой постоянного хранения данных (этапы 0–1).
+// Слой постоянного хранения данных (этапы 0–3).
 // Заменяет временные Map/массивы в памяти: пользователи, сессии,
 // платежи, история игр и журнал админ-действий теперь живут в SQLite
 // и переживают перезапуск сервера.
@@ -6,6 +6,13 @@
 // better-sqlite3 выбран из-за синхронного API: обработчики остаются
 // простыми, без async/await, а подготовленные выражения и транзакции
 // дают атомарность изменений баланса.
+//
+// Гарантии баланса (этап 3):
+//   * все изменения — атомарные операции или транзакции;
+//   * CHECK (balance >= 0) в схеме физически запрещает минус;
+//   * единственные пути изменения баланса: processPayment (платежи),
+//     applySpin (слоты) и adjustBalance (ручные операции админа,
+//     подключается на этапе 5). Ни один другой код балансы не трогает.
 //
 // Файл базы создаётся автоматически: mock-server/data.sqlite
 // (+ data.sqlite-wal / data.sqlite-shm в режиме WAL).
@@ -59,8 +66,9 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_sessions_nickname ON sessions(nickname);
 
-  -- Принятые платежи. Уникальный event_id — основа
-  -- идемпотентности (подключается на этапе 2)
+  -- Принятые платежи. Уникальный event_id — основа идемпотентности:
+  -- повторная доставка перевода не может попасть в таблицу вторым
+  -- рядом (PRIMARY KEY отклонит её на уровне БД)
   CREATE TABLE IF NOT EXISTS payments (
     event_id     TEXT PRIMARY KEY,
     nickname     TEXT NOT NULL,
@@ -120,6 +128,9 @@ const stmts = {
     WHERE nickname_lower = @nicknameLower
   `),
 
+  // Начисление платежа. Вызывается ТОЛЬКО внутри транзакции
+  // processPaymentTx (см. раздел "Платежи") — отдельно использовать
+  // нельзя, иначе снова появится окно между деньгами и журналом
   applyPayment: db.prepare(`
     UPDATE users
     SET balance = balance + @amount,
@@ -138,6 +149,7 @@ const stmts = {
   // Атомарная прокрутка слотов: списание, выигрыш и накопительная
   // статистика — один UPDATE. Условие balance >= @bet не даёт
   // балансу уйти в минус даже при одновременных запросах
+  // (гонки быстрых кликов исключены, этап 3)
   applySpin: db.prepare(`
     UPDATE users
     SET balance         = balance - @bet + @winAmount,
@@ -146,6 +158,22 @@ const stmts = {
         slots_win_total = slots_win_total + @winAmount
     WHERE nickname_lower = @nicknameLower AND balance >= @bet
   `),
+
+  // Произвольное изменение баланса одной операцией (этап 3):
+  // ручные начисления/списания админа (этап 5). Списание сверх
+  // текущего баланса не применяется (changes === 0)
+  adjustBalance: db.prepare(`
+    UPDATE users
+    SET balance = balance + @delta
+    WHERE nickname_lower = @nicknameLower AND balance + @delta >= 0
+  `),
+
+  // Контроль целостности: число пользователей с отрицательным
+  // балансом. Схема запрещает такие значения через CHECK,
+  // запрос — страховка от повреждения базы внешними инструментами
+  countNegativeBalances: db.prepare(
+    "SELECT COUNT(*) AS n FROM users WHERE balance < 0"
+  ),
 
   insertSession: db.prepare(`
     INSERT INTO sessions (token, nickname, created_at, expires_at)
@@ -231,17 +259,6 @@ function setUserPassword(nickname, passwordHash) {
   });
 }
 
-// Начисление платежа одной операцией
-function applyPayment(nickname, amount) {
-  const result = stmts.applyPayment.run({
-    amount,
-    paidAt: new Date().toISOString(),
-    nicknameLower: nickname.toLowerCase(),
-  });
-
-  return result.changes > 0;
-}
-
 // Результат обычной игры: +1 к gamesPlayed и к wins либо losses
 function addGameResult(nickname, won) {
   stmts.addGameStats.run({
@@ -261,6 +278,26 @@ function applySpin(nickname, bet, winAmount) {
   });
 
   return result.changes > 0;
+}
+
+// Атомарное изменение баланса на произвольную дельту (этап 3).
+// Условие balance + @delta >= 0 не даёт уйти в минус даже при
+// параллельных операциях; CHECK-ограничение схемы страхует вдобавок.
+// Обработчиками пока не используется — готовится для ручных
+// начислений/списаний админкой (этап 5)
+function adjustBalance(nickname, delta) {
+  const result = stmts.adjustBalance.run({
+    delta,
+    nicknameLower: nickname.toLowerCase(),
+  });
+
+  return result.changes > 0;
+}
+
+// Число пользователей с отрицательным балансом.
+// Нормальное значение — всегда 0; вызывается при старте сервера
+function countNegativeBalances() {
+  return stmts.countNegativeBalances.get().n;
 }
 
 // ===== Сессии =====
@@ -337,15 +374,35 @@ function getHistory() {
   }));
 }
 
-// ===== Платежи (идемпотентность, подключается на этапе 2) =====
+// ===== Платежи (этапы 2–3) =====
 
 function isEventProcessed(eventId) {
   if (!eventId) return false;
   return !!stmts.selectPaymentByEvent.get(eventId);
 }
 
-function markEventProcessed({ eventId, nickname, amount, currency, rawMessage }) {
-  stmts.insertPayment.run({
+// Начисление платежа + запись в журнал — ОДНА транзакция (этап 3).
+//
+// Раньше это были два отдельных вызова: если бы процесс упал между
+// начислением и отметкой eventId, повторная доставка перевода после
+// рестарта зачислила бы деньги второй раз. Общая транзакция закрывает
+// это окно: применяются либо обе операции, либо ни одна.
+//
+// Второй барьер — сама БД: повторная вставка того же event_id
+// невозможна, PRIMARY KEY таблицы payments бросит ошибку ограничения
+// (обрабатывается через isUniqueConstraintError)
+const processPaymentTx = db.transaction(record => {
+  stmts.applyPayment.run({
+    amount: record.amount,
+    paidAt: record.createdAt,
+    nicknameLower: record.nickname.toLowerCase(),
+  });
+
+  stmts.insertPayment.run(record);
+});
+
+function processPayment({ nickname, amount, eventId, currency, rawMessage }) {
+  processPaymentTx.run({
     eventId,
     nickname,
     amount,
@@ -353,6 +410,16 @@ function markEventProcessed({ eventId, nickname, amount, currency, rawMessage })
     rawMessage: rawMessage ?? null,
     createdAt: new Date().toISOString(),
   });
+}
+
+// Определить по ошибке better-sqlite3, что она вызвана нарушением
+// ограничения уникальности (например, повторный event_id)
+function isUniqueConstraintError(err) {
+  return (
+    err instanceof Error &&
+    typeof err.code === "string" &&
+    err.code.startsWith("SQLITE_CONSTRAINT")
+  );
 }
 
 // ===== Журнал админ-действий (этап 5) =====
@@ -371,9 +438,10 @@ module.exports = {
   getUser,
   createUser,
   setUserPassword,
-  applyPayment,
   addGameResult,
   applySpin,
+  adjustBalance,
+  countNegativeBalances,
   createSession,
   getSession,
   deleteSession,
@@ -382,6 +450,7 @@ module.exports = {
   addHistoryEntry,
   getHistory,
   isEventProcessed,
-  markEventProcessed,
+  processPayment,
+  isUniqueConstraintError,
   logAdminAction,
 };
