@@ -136,6 +136,14 @@ const SLOT_SYMBOLS = ["🍒", "🍋", "🔔", "💎", "⭐", "🍀", "7"];
 // Настройки платежей Minecraft (этап 2)
 const PAYMENT_MIN_AMOUNT = 10; // минимальная сумма одного перевода
 
+// Настройки отчётов о ЛОКАЛЬНЫХ играх (этап 4).
+// Клиент присылает результат сам (fallback-режим УНО без связи
+// с сервером), поэтому без ограничения частоты статистику можно
+// было бы накручивать циклом запросов. Для честной игры лимит
+// заведомо недостижим: локальная партия длится минуты
+const LOCAL_RESULT_WINDOW_MS = 60000;       // окно учёта: 1 минута
+const LOCAL_RESULT_MAX_PER_WINDOW = 10;     // максимум отчётов за окно
+
 // Сообщения движка УНО, означающие отклонённое действие.
 // В этом случае состояние НЕ применяется, а ошибка уходит только отправителю.
 const ERROR_RESULTS = new Set([
@@ -152,7 +160,14 @@ const ERROR_RESULTS = new Set([
 // processPayment (переводы из Minecraft), applySpin (слоты) и
 // adjustBalance (будущие админ-операции). Ни один клиентский запрос
 // не принимает значение баланса из тела; минус невозможен благодаря
-// CHECK-ограничению схемы и условиям внутри UPDATE
+// CHECK-ограничению схемы и условиям внутри UPDATE.
+//
+// ИСТОРИЯ (этап 4): у каждой записи есть источник — "network"
+// (сетевая партия, результат записан самим сервером) или "local"
+// (результат локальной партии от клиента, сервером не проверялся).
+// Слоты в общую историю не попадают вовсе: чтобы не вытеснять
+// карточные партии из короткого списка, у них отдельная
+// накопительная статистика (safeUser -> slotsStats)
 
 // Допустимые сложности ботов
 const ALLOWED_DIFFICULTIES = ["easy", "medium", "hard"];
@@ -225,9 +240,37 @@ function generateToken() {
   return crypto.randomBytes(24).toString("hex");
 }
 
+// Временные метки отчётов о локальных играх: Map<ник, number[]>.
+// Используется анти-накруткой /api/game/result (этап 4)
+const localResultTimestamps = new Map();
+
+// Разрешён ли игроку ещё один отчёт о локальной игре (этап 4).
+// Скользящее окно: храним временные метки последних отчётов и
+// отбрасываем вышедшие из окна. Отклонённые попытки квоту не тратят
+function isLocalResultAllowed(nickname) {
+  const now = Date.now();
+
+  const timestamps = (localResultTimestamps.get(nickname) || []).filter(
+    t => now - t < LOCAL_RESULT_WINDOW_MS
+  );
+
+  if (timestamps.length >= LOCAL_RESULT_MAX_PER_WINDOW) {
+    localResultTimestamps.set(nickname, timestamps);
+    return false;
+  }
+
+  timestamps.push(now);
+  localResultTimestamps.set(nickname, timestamps);
+
+  return true;
+}
+
 // Публичное представление пользователя для клиента.
 // На входе — строка из БД (плоские колонки), на выходе — прежняя
-// форма ответа API, чтобы фронтенд не менялся
+// форма ответа API, чтобы фронтенд не менялся.
+// Этап 4: добавлена отдельная слот-статистика slotsStats —
+// она НЕ входит в stats, потому что слоты не должны смешиваться
+// с победами/поражениями карточных игр
 function safeUser(user) {
   return {
     nickname: user.nickname,
@@ -238,6 +281,13 @@ function safeUser(user) {
       wins: user.wins,
       losses: user.losses,
       gamesPlayed: user.games_played,
+    },
+    // Слот-статистика (этап 4). Чистый результат игрока в слотах
+    // считается на клиенте как winTotal - betTotal
+    slotsStats: {
+      spins: user.slots_spins,
+      betTotal: user.slots_bet_total,
+      winTotal: user.slots_win_total,
     },
   };
 }
@@ -413,7 +463,9 @@ function scheduleBotMove(room) {
 // оставшихся в комнате, плюс запись в общую историю.
 // Единая схема для всех игр: победитель получает win, остальные — loss.
 // Для Дурака winner — первый избавившийся от карт,
-// остальные (включая дурака) — проигравшие
+// остальные (включая дурака) — проигравшие.
+// Этап 4: запись помечается source: "network" — результат
+// вычислен самим сервером и ему можно доверять
 function recordResults(room) {
   const winner = room.state.winner || "";
   const players = room.state.players.map(p => p.name);
@@ -440,6 +492,7 @@ function recordResults(room) {
     players,
     date: new Date().toISOString(),
     durationSec,
+    source: "network",
   });
 
   console.log("[GAME FINISHED]", { tableId: room.tableId, game: room.game, winner, durationSec });
@@ -1027,7 +1080,8 @@ app.post("/api/auth/login", (req, res) => {
 });
 
 // Проверка сессии и получение профиля.
-// Сессия уже проверена middleware (этап 1)
+// Сессия уже проверена middleware (этап 1).
+// Ответ включает slotsStats (этап 4) — см. safeUser
 app.get("/api/me", (req, res) => {
   const user = getUser(req.sessionNickname);
 
@@ -1457,7 +1511,8 @@ app.get("/api/lobby/my-table", (req, res) => {
 });
 
 // Прокрутка слотов. Баланс меняет только сервер одной операцией;
-// статистика wins/losses/gamesPlayed слотами НЕ затрагивается.
+// статистика wins/losses/gamesPlayed слотами НЕ затрагивается —
+// копится отдельная slots_* статистика (этап 4).
 // Гонки быстрых кликов исключены атомарностью UPDATE (этап 3)
 app.post("/api/slots/spin", (req, res) => {
   const nickname = req.sessionNickname;
@@ -1543,9 +1598,25 @@ app.post("/api/slots/spin", (req, res) => {
 
 // Результат завершённой ЛОКАЛЬНОЙ игры (fallback-режим клиента УНО).
 // Сетевые партии сервер записывает сам в recordResults().
-// На баланс этот эндпоинт НЕ влияет — только статистика (этап 3)
+// На баланс этот эндпоинт НЕ влияет — только статистика (этап 3).
+//
+// Этап 4: добавлены две защиты от накрутки:
+//   1. Лимит частоты — не больше LOCAL_RESULT_MAX_PER_WINDOW отчётов
+//      в минуту на игрока, иначе 429. Честному игроку недостижимо,
+//      циклом статистику качать нельзя;
+//   2. Запись помечается source: "local" — видно, что результат
+//      пришёл от клиента и сервером не проверялся
 app.post("/api/game/result", (req, res) => {
   const nickname = req.sessionNickname;
+
+  // Анти-накрутка (этап 4): см. комментарий к константам выше.
+  // Сетевые партии этот лимит не затрагивает — их пишет сам сервер
+  if (!isLocalResultAllowed(nickname)) {
+    return res.status(429).json({
+      ok: false,
+      error: "Слишком много отчётов подряд, попробуй чуть позже",
+    });
+  }
 
   const user = getUser(nickname);
 
@@ -1594,6 +1665,9 @@ app.post("/api/game/result", (req, res) => {
     players,
     date: new Date().toISOString(),
     durationSec: duration,
+    // Результат прислан клиентом и сервером не проверялся —
+    // помечаем как локальный (отличим в истории и админке)
+    source: "local",
   });
 
   const updated = getUser(nickname);
@@ -1609,7 +1683,9 @@ app.post("/api/game/result", (req, res) => {
 });
 
 // История последних игр.
-// Доступ только с валидной сессией (middleware, этап 1)
+// Доступ только с валидной сессией (middleware, этап 1).
+// Каждая запись содержит source (этап 4): "network" — партия
+// на сервере, "local" — результат от клиента без проверки
 app.get("/api/history", (req, res) => {
   return res.json({
     ok: true,

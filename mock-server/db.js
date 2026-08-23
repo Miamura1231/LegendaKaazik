@@ -1,4 +1,4 @@
-// Слой постоянного хранения данных (этапы 0–3).
+// Слой постоянного хранения данных (этапы 0–4).
 // Заменяет временные Map/массивы в памяти: пользователи, сессии,
 // платежи, история игр и журнал админ-действий теперь живут в SQLite
 // и переживают перезапуск сервера.
@@ -13,6 +13,12 @@
 //   * единственные пути изменения баланса: processPayment (платежи),
 //     applySpin (слоты) и adjustBalance (ручные операции админа,
 //     подключается на этапе 5). Ни один другой код балансы не трогает.
+//
+// История (этап 4): каждая запись помечена источником (колонка source):
+//   "network" — сетевая партия, результат записал сам сервер;
+//   "local"   — результат локальной партии от клиента, сервером
+//               не проверялся. Слоты в историю не пишутся вовсе —
+//               у них отдельная накопительная статистика в users.
 //
 // Файл базы создаётся автоматически: mock-server/data.sqlite
 // (+ data.sqlite-wal / data.sqlite-shm в режиме WAL).
@@ -40,6 +46,8 @@ db.exec(`
   -- лениво: при первом успешном входе хеш перезаписывается
   -- (см. auth.js и /api/auth/login в server.js).
   -- CHECK гарантирует: баланс никогда не уйдёт в минус.
+  -- Колонки slots_* — отдельная слот-статистика (этапы 0 и 4):
+  -- слоты намеренно НЕ увеличивают wins/losses/games_played.
   CREATE TABLE IF NOT EXISTS users (
     nickname         TEXT PRIMARY KEY,
     nickname_lower   TEXT NOT NULL UNIQUE,
@@ -79,7 +87,8 @@ db.exec(`
   );
 
   -- История игр. players_json — массив ников в JSON.
-  -- game_type разделяет uno / durak / slots (этап 4)
+  -- game_type разделяет uno / durak (этап 4); слоты сюда не пишутся.
+  -- Колонка source добавляется миграцией ниже (этап 4)
   CREATE TABLE IF NOT EXISTS history (
     id            TEXT PRIMARY KEY,
     game_type     TEXT NOT NULL DEFAULT 'uno',
@@ -98,6 +107,31 @@ db.exec(`
     date    TEXT NOT NULL
   );
 `);
+
+// ===== Лёгкие миграции схемы =====
+//
+// CREATE TABLE IF NOT EXISTS не изменяет уже существующие таблицы,
+// поэтому новые колонки добавляются отдельными ALTER TABLE.
+// Функция идемпотентна: при повторных стартах колонка не дублируется.
+
+function ensureColumn(table, column, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+
+  if (!columns.some(col => col.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${definition}`);
+  }
+}
+
+// Этап 4: источник записи истории.
+//   "network" — партия сыграна на сервере, результат записан самим
+//               сервером (recordResults), ему можно доверять;
+//   "local"   — результат локальной партии клиента (fallback-режим
+//               УНО без связи с сервером), прислан клиентом и сервером
+//               НЕ проверялся. Помечается, чтобы такие записи можно
+//               было отличить в интерфейсе и админке.
+// Старые записи получают значение по умолчанию "network":
+// до этапа 4 все записи в БД создавались только сервером
+ensureColumn("history", "source", "source TEXT NOT NULL DEFAULT 'network'");
 
 // ===== Константы =====
 
@@ -149,7 +183,9 @@ const stmts = {
   // Атомарная прокрутка слотов: списание, выигрыш и накопительная
   // статистика — один UPDATE. Условие balance >= @bet не даёт
   // балансу уйти в минус даже при одновременных запросах
-  // (гонки быстрых кликов исключены, этап 3)
+  // (гонки быстрых кликов исключены, этап 3).
+  // ВАЖНО (этап 4): wins/losses/games_played здесь НЕ трогаются —
+  // слот-статистика живёт отдельно от карточной
   applySpin: db.prepare(`
     UPDATE users
     SET balance         = balance - @bet + @winAmount,
@@ -192,8 +228,8 @@ const stmts = {
   ),
 
   insertHistory: db.prepare(`
-    INSERT INTO history (id, game_type, winner, players_json, date, duration_sec)
-    VALUES (@id, @gameType, @winner, @playersJson, @date, @durationSec)
+    INSERT INTO history (id, game_type, winner, players_json, date, duration_sec, source)
+    VALUES (@id, @gameType, @winner, @playersJson, @date, @durationSec, @source)
   `),
 
   selectHistory: db.prepare(
@@ -259,7 +295,9 @@ function setUserPassword(nickname, passwordHash) {
   });
 }
 
-// Результат обычной игры: +1 к gamesPlayed и к wins либо losses
+// Результат обычной игры: +1 к gamesPlayed и к wins либо losses.
+// Вызывается ТОЛЬКО для карточных партий (УНО/Дурак) —
+// слоты идут через applySpin со своей статистикой (этап 4)
 function addGameResult(nickname, won) {
   stmts.addGameStats.run({
     win: won ? 1 : 0,
@@ -349,9 +387,14 @@ function deleteExpiredSessions() {
   stmts.deleteExpiredSessions.run(new Date().toISOString());
 }
 
-// ===== История =====
+// ===== История (этап 4) =====
 
-function addHistoryEntry({ id, gameType, winner, players, date, durationSec }) {
+// Добавить запись в историю.
+// source: "network" (по умолчанию) — партия на сервере;
+//         "local" — результат, присланный клиентом без проверки.
+// Все внутренние вызовы (recordResults) создают сетевые записи,
+// поэтому параметр опционален
+function addHistoryEntry({ id, gameType, winner, players, date, durationSec, source }) {
   addHistoryTx.run({
     id,
     gameType: gameType || "uno",
@@ -359,10 +402,12 @@ function addHistoryEntry({ id, gameType, winner, players, date, durationSec }) {
     playersJson: JSON.stringify(players),
     date,
     durationSec,
+    source: source || "network",
   });
 }
 
-// Записи в формате, который ждёт клиент: players — массив, не JSON-строка
+// Записи в формате, который ждёт клиент: players — массив, не JSON-строка.
+// Поле source добавлено в этапе 4; старые клиенты просто игнорируют его
 function getHistory() {
   return stmts.selectHistory.all().map(row => ({
     id: row.id,
@@ -371,6 +416,7 @@ function getHistory() {
     players: JSON.parse(row.players_json),
     date: row.date,
     durationSec: row.duration_sec,
+    source: row.source,
   }));
 }
 
