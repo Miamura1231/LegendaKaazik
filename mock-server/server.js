@@ -45,6 +45,12 @@ const {
   isUniqueConstraintError,
   // Контроль целостности балансов при старте (этап 3)
   countNegativeBalances,
+  // Админка (этап 5): списки, роли, сброс статистики, журнал
+  adjustBalance,
+  getAllUsers,
+  setUserRole,
+  resetUserStats,
+  getAdminLog,
 } = require("./db");
 // Хеширование и проверка паролей (этап 1)
 const {
@@ -89,6 +95,8 @@ app.use(express.static(DIST_DIR));
 // Прошедшим проверку обработчикам доступны:
 //   req.sessionNickname — ник игрока из сессии;
 //   req.sessionToken    — сам токен (нужен для выхода).
+//
+// Эндпоинты /api/admin/* дополнительно проходят requireAdmin (этап 5).
 const PUBLIC_API_PATHS = new Set([
   "/api/auth/login",
   "/api/minecraft/payment",
@@ -144,6 +152,24 @@ const PAYMENT_MIN_AMOUNT = 10; // минимальная сумма одного
 const LOCAL_RESULT_WINDOW_MS = 60000;       // окно учёта: 1 минута
 const LOCAL_RESULT_MAX_PER_WINDOW = 10;     // максимум отчётов за окно
 
+// Настройки админки (этап 5)
+const ADMIN_LOG_DEFAULT_LIMIT = 50;   // записей журнала по умолчанию
+const ADMIN_LOG_MAX_LIMIT = 500;      // жёсткий потолок выборки журнала
+// Защита от опечаток в ручном изменении баланса:
+// одна операция не может сдвинуть баланс больше чем на эту сумму
+const ADMIN_BALANCE_MAX_DELTA = 1000000;
+
+// Ники админов задаются переменной окружения ADMIN_NICKNAMES
+// (через запятую), например:
+//   ADMIN_NICKNAMES="Vasya,Petya" node server.js
+// Аккаунты создаются переводами из Minecraft, поэтому ники сверяются
+// без учёта регистра. Если аккаунта ещё нет — роль выдастся при
+// первом входе этого игрока (см. promoteAdminIfNeeded)
+const ADMIN_NICKNAMES = (process.env.ADMIN_NICKNAMES || "")
+  .split(",")
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
 // Сообщения движка УНО, означающие отклонённое действие.
 // В этом случае состояние НЕ применяется, а ошибка уходит только отправителю.
 const ERROR_RESULTS = new Set([
@@ -158,16 +184,20 @@ const ERROR_RESULTS = new Set([
 //
 // БАЛАНС (этап 3): меняется ТОЛЬКО на сервере и только тремя путями —
 // processPayment (переводы из Minecraft), applySpin (слоты) и
-// adjustBalance (будущие админ-операции). Ни один клиентский запрос
-// не принимает значение баланса из тела; минус невозможен благодаря
-// CHECK-ограничению схемы и условиям внутри UPDATE.
+// adjustBalance (ручные операции админа, этап 5). Ни один клиентский
+// запрос не принимает значение баланса из тела; минус невозможен
+// благодаря CHECK-ограничению схемы и условиям внутри UPDATE.
 //
 // ИСТОРИЯ (этап 4): у каждой записи есть источник — "network"
 // (сетевая партия, результат записан самим сервером) или "local"
 // (результат локальной партии от клиента, сервером не проверялся).
 // Слоты в общую историю не попадают вовсе: чтобы не вытеснять
 // карточные партии из короткого списка, у них отдельная
-// накопительная статистика (safeUser -> slotsStats)
+// накопительная статистика (safeUser -> slotsStats).
+//
+// АДМИНКА (этап 5): роль хранится в колонке users.role ('player' |
+// 'admin'). Все /api/admin/* закрыты сессией + requireAdmin; каждое
+// изменяющее действие пишется в admin_log — кто, что и когда сделал
 
 // Допустимые сложности ботов
 const ALLOWED_DIFFICULTIES = ["easy", "medium", "hard"];
@@ -265,16 +295,39 @@ function isLocalResultAllowed(nickname) {
   return true;
 }
 
+// Повысить пользователя до админа, если его ник указан в
+// ADMIN_NICKNAMES (этап 5).
+//
+// Вызывается в двух местах:
+//   * при старте сервера — для уже существующих аккаунтов;
+//   * при каждом успешном входе — чтобы аккаунт, созданный ПОСЛЕ
+//     старта сервера (первым переводом в Minecraft), получил роль
+//     без перезапуска процесса.
+function promoteAdminIfNeeded(nickname) {
+  if (!ADMIN_NICKNAMES.includes(nickname.toLowerCase())) return;
+
+  const user = getUser(nickname);
+  if (!user) return;
+
+  if (user.role !== "admin") {
+    setUserRole(user.nickname, "admin");
+    console.log(`[ADMIN] ${user.nickname} получил роль администратора`);
+  }
+}
+
 // Публичное представление пользователя для клиента.
 // На входе — строка из БД (плоские колонки), на выходе — прежняя
 // форма ответа API, чтобы фронтенд не менялся.
 // Этап 4: добавлена отдельная слот-статистика slotsStats —
 // она НЕ входит в stats, потому что слоты не должны смешиваться
-// с победами/поражениями карточных игр
+// с победами/поражениями карточных игр.
+// Этап 5: добавлено поле role — фронтенд по нему решает,
+// показывать ли интерфейс админки
 function safeUser(user) {
   return {
     nickname: user.nickname,
     balance: user.balance,
+    role: user.role,
     createdAt: user.created_at,
     lastPaymentAt: user.last_payment_at,
     stats: {
@@ -1042,7 +1095,7 @@ app.post("/api/auth/login", (req, res) => {
     });
   }
 
-  const user = getUser(nickname);
+  let user = getUser(nickname);
 
   if (!user) {
     return res.status(404).json({
@@ -1068,6 +1121,15 @@ app.post("/api/auth/login", (req, res) => {
     console.log(`[AUTH] Пароль игрока ${user.nickname} переведён в bcrypt-хеш`);
   }
 
+  // Этап 5: если ник в списке ADMIN_NICKNAMES — повышаем до админа
+  // прямо при входе. Это покрывает случай, когда аккаунт был создан
+  // переводом из Minecraft уже ПОСЛЕ старта сервера
+  promoteAdminIfNeeded(user.nickname);
+
+  // Перечитываем: роль могла обновиться — safeUser должен отдать
+  // актуальное значение
+  user = getUser(nickname);
+
   const token = generateToken();
 
   createSession(user.nickname, token);
@@ -1081,7 +1143,7 @@ app.post("/api/auth/login", (req, res) => {
 
 // Проверка сессии и получение профиля.
 // Сессия уже проверена middleware (этап 1).
-// Ответ включает slotsStats (этап 4) — см. safeUser
+// Ответ включает slotsStats (этап 4) и role (этап 5) — см. safeUser
 app.get("/api/me", (req, res) => {
   const user = getUser(req.sessionNickname);
 
@@ -1119,6 +1181,244 @@ app.post("/api/auth/logout-all", (req, res) => {
 
   return res.json({
     ok: true,
+  });
+});
+
+// ===== Админка (этап 5) =====
+//
+// Все эндпоинты ниже требуют:
+//   1. валидную сессию — общий auth-middleware (этап 1);
+//   2. роль admin — requireAdmin ниже.
+// Каждое ИЗМЕНЯЮЩЕЕ действие пишется в admin_log через logAdminAction:
+// кто (админ), что (тип действия), детали, когда.
+
+// Проверка роли администратора. Выполняется ПОСЛЕ общего
+// auth-middleware, поэтому req.sessionNickname уже заполнен
+function requireAdmin(req, res, next) {
+  const user = getUser(req.sessionNickname);
+
+  if (!user || user.role !== "admin") {
+    return res.status(403).json({
+      ok: false,
+      error: "Доступ только для администраторов",
+    });
+  }
+
+  req.adminNickname = user.nickname;
+  next();
+}
+
+// Список всех игроков: балансы, роли, обе статистики.
+// Используется админкой для просмотра и выбора цели операций
+app.get("/api/admin/players", requireAdmin, (req, res) => {
+  const players = getAllUsers().map(u => ({
+    nickname: u.nickname,
+    balance: u.balance,
+    role: u.role,
+    createdAt: u.created_at,
+    lastPaymentAt: u.last_payment_at,
+    stats: {
+      wins: u.wins,
+      losses: u.losses,
+      gamesPlayed: u.games_played,
+    },
+    slotsStats: {
+      spins: u.slots_spins,
+      betTotal: u.slots_bet_total,
+      winTotal: u.slots_win_total,
+    },
+  }));
+
+  return res.json({
+    ok: true,
+    players,
+  });
+});
+
+// Ручное начисление/списание валюты.
+// Тело: { nickname, delta } — delta целое число:
+//   положительное = начислить, отрицательное = списать.
+// Списание сверх текущего баланса отклоняется: adjustBalance
+// физически не даёт балансу уйти в минус (этап 3).
+// Операция пишется в admin_log
+app.post("/api/admin/balance", requireAdmin, (req, res) => {
+  const { nickname, delta } = req.body || {};
+
+  if (typeof nickname !== "string" || nickname === "") {
+    return res.status(400).json({
+      ok: false,
+      error: "Не указан игрок",
+    });
+  }
+
+  const parsedDelta = Number(delta);
+
+  if (!Number.isInteger(parsedDelta) || parsedDelta === 0) {
+    return res.status(400).json({
+      ok: false,
+      error: "delta должна быть ненулевым целым числом",
+    });
+  }
+
+  // Защита от опечаток вроде 10000000 вместо 100000
+  if (Math.abs(parsedDelta) > ADMIN_BALANCE_MAX_DELTA) {
+    return res.status(400).json({
+      ok: false,
+      error: `Слишком большая сумма (лимит ±${ADMIN_BALANCE_MAX_DELTA})`,
+    });
+  }
+
+  const user = getUser(nickname);
+
+  if (!user) {
+    return res.status(404).json({
+      ok: false,
+      error: "Игрок не найден",
+    });
+  }
+
+  const applied = adjustBalance(user.nickname, parsedDelta);
+
+  if (!applied) {
+    return res.status(400).json({
+      ok: false,
+      error: "Недостаточно средств для списания",
+    });
+  }
+
+  const updated = getUser(nickname);
+
+  logAdminAction(
+    req.adminNickname,
+    parsedDelta > 0 ? "balance_add" : "balance_subtract",
+    `${parsedDelta > 0 ? "+" : ""}${parsedDelta} -> ${updated.nickname} (баланс стал ${updated.balance})`
+  );
+
+  console.log(`[ADMIN] ${req.adminNickname}: баланс ${updated.nickname} изменён на ${parsedDelta}`);
+
+  return res.json({
+    ok: true,
+    player: {
+      nickname: updated.nickname,
+      balance: updated.balance,
+    },
+  });
+});
+
+// Активные столы с реальным составом участников.
+// Отличается от публичного /api/lobby: админ видит ники сидящих
+// и факт наличия живой комнаты (даже если партия ещё не начата)
+app.get("/api/admin/tables", requireAdmin, (req, res) => {
+  const activeTables = tables.map(table => {
+    const room = games.get(table.id);
+
+    return {
+      ...tableView(table),
+      // Кто реально сидит за столом прямо сейчас
+      humans: room ? [...room.humans.keys()] : [],
+      // Есть ли живая комната (партия или ожидание режима "players")
+      hasRoom: !!room,
+    };
+  });
+
+  return res.json({
+    ok: true,
+    tables: activeTables,
+  });
+});
+
+// Принудительное удаление стола — в том числе ЗАВИСШЕГО ВО ВРЕМЯ ИГРЫ.
+// В отличие от /api/lobby/delete не требует прав создателя и работает
+// при любом статусе: комната уничтожается вместе с таймерами, стол
+// убирается из лобби. Соединения игроков не закрываются принудительно —
+// клиенты обнаружат исчезновение стола через опрос my-table
+// (вернёт null) и выйдут из комнаты сами, как при обычном кике
+app.post("/api/admin/tables/delete", requireAdmin, (req, res) => {
+  const { tableId } = req.body || {};
+
+  if (typeof tableId !== "string" || tableId === "") {
+    return res.status(400).json({
+      ok: false,
+      error: "Не указан стол",
+    });
+  }
+
+  const table = tables.find(t => t.id === tableId);
+
+  if (!table) {
+    return res.status(404).json({
+      ok: false,
+      error: "Стол не найден",
+    });
+  }
+
+  destroyRoom(tableId);
+  tables = tables.filter(t => t.id !== tableId);
+
+  logAdminAction(
+    req.adminNickname,
+    "table_force_delete",
+    `«${table.name}» (${table.id}, статус: ${tableStatus(table)})`
+  );
+
+  console.log(`[ADMIN] ${req.adminNickname} принудительно удалил стол «${table.name}»`);
+
+  return res.json({
+    ok: true,
+  });
+});
+
+// Сброс статистики игрока: карточной (wins/losses/gamesPlayed)
+// и слот-статистики одновременно. Баланс НЕ трогается.
+// Операция пишется в admin_log
+app.post("/api/admin/reset-stats", requireAdmin, (req, res) => {
+  const { nickname } = req.body || {};
+
+  if (typeof nickname !== "string" || nickname === "") {
+    return res.status(400).json({
+      ok: false,
+      error: "Не указан игрок",
+    });
+  }
+
+  const user = getUser(nickname);
+
+  if (!user) {
+    return res.status(404).json({
+      ok: false,
+      error: "Игрок не найден",
+    });
+  }
+
+  resetUserStats(user.nickname);
+
+  logAdminAction(req.adminNickname, "reset_stats", user.nickname);
+
+  console.log(`[ADMIN] ${req.adminNickname} сбросил статистику игрока ${user.nickname}`);
+
+  return res.json({
+    ok: true,
+    player: {
+      nickname: user.nickname,
+      stats: { wins: 0, losses: 0, gamesPlayed: 0 },
+      slotsStats: { spins: 0, betTotal: 0, winTotal: 0 },
+    },
+  });
+});
+
+// Журнал действий админов, самые свежие первыми.
+// Лимит настраивается query-параметром ?limit=N (по умолчанию 50,
+// максимум 500 — чтобы одним запросом нельзя было выкачать всю базу)
+app.get("/api/admin/log", requireAdmin, (req, res) => {
+  const parsedLimit = Number(req.query.limit);
+  const limit =
+    Number.isInteger(parsedLimit) && parsedLimit > 0 && parsedLimit <= ADMIN_LOG_MAX_LIMIT
+      ? parsedLimit
+      : ADMIN_LOG_DEFAULT_LIMIT;
+
+  return res.json({
+    ok: true,
+    log: getAdminLog(limit),
   });
 });
 
@@ -1760,6 +2060,18 @@ setInterval(deleteExpiredSessions, 60 * 60 * 1000);
   } else {
     console.log("[DB] Целостность балансов в порядке");
   }
+}
+
+// Повышение админов при старте (этап 5): все существующие аккаунты
+// из списка ADMIN_NICKNAMES получают роль admin. Аккаунты, созданные
+// позже, повысятся при первом входе (см. /api/auth/login)
+if (ADMIN_NICKNAMES.length > 0) {
+  for (const nick of ADMIN_NICKNAMES) {
+    promoteAdminIfNeeded(nick);
+  }
+  console.log(`[ADMIN] Список админов: ${ADMIN_NICKNAMES.join(", ")}`);
+} else {
+  console.log("[ADMIN] ADMIN_NICKNAMES не задан — админка недоступна");
 }
 
 server.listen(PORT, () => {

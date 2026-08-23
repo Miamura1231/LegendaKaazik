@@ -1,0 +1,5 @@
+# локально
+ADMIN_NICKNAMES="ТвойНик" npm start
+
+# на VPS (pm2)
+ADMIN_NICKNAMES="ТвойНик" PAYMENT_SECRET="..." pm2 start server.js

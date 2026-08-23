@@ -220,3 +220,115 @@ export async function apiGameResult(
 export async function apiHistory(): Promise<HistoryResponse> {
   return request(`${API_URL}/api/history`, { headers: authHeaders() });
 }
+
+// ===== Админка (этап 5) =====
+//
+// Типы описаны здесь, а не в ./types, чтобы не трогать файл,
+// которого нет в этом чате. При желании их можно перенести туда.
+
+// Игрок в списке админки: балансы, роль и обе статистики
+export interface AdminPlayerInfo {
+  nickname: string;
+  balance: number;
+  role: string;
+  createdAt: string;
+  lastPaymentAt: string | null;
+  stats: { wins: number; losses: number; gamesPlayed: number };
+  slotsStats: { spins: number; betTotal: number; winTotal: number };
+}
+
+// Стол в списке админки: публичные поля + живой состав.
+// Поля игры/сложности оставлены строками: сервер отдаёт их как есть
+export interface AdminTableInfo {
+  id: string;
+  game: string;
+  name: string;
+  players: number;
+  maxPlayers: number;
+  minPlayers: number;
+  minAmount: number;
+  difficulty: string;
+  status: string;
+  mode: string;
+  creatorNickname: string;
+  hasPassword: boolean;
+  autoDeleteAt: number | null;
+  // Кто реально сидит за столом прямо сейчас
+  humans: string[];
+  // Есть ли живая комната (партия или ожидание режима "players")
+  hasRoom: boolean;
+}
+
+// Запись журнала действий админов
+export interface AdminLogEntry {
+  id: number;
+  admin: string;
+  action: string;
+  details: string | null;
+  date: string;
+}
+
+// Список всех игроков с балансами и статистикой
+export async function apiAdminPlayers(): Promise<{
+  ok: boolean;
+  players?: AdminPlayerInfo[];
+  error?: string;
+}> {
+  return request(`${API_URL}/api/admin/players`, { headers: authHeaders() });
+}
+
+// Ручное начисление (delta > 0) или списание (delta < 0) валюты.
+// Списание сверх баланса сервер отклонит
+export async function apiAdminAdjustBalance(
+  nickname: string,
+  delta: number
+): Promise<{
+  ok: boolean;
+  player?: { nickname: string; balance: number };
+  error?: string;
+}> {
+  return request(
+    `${API_URL}/api/admin/balance`,
+    jsonInit("POST", { nickname, delta }, authHeaders())
+  );
+}
+
+// Активные столы с составом участников
+export async function apiAdminTables(): Promise<{
+  ok: boolean;
+  tables?: AdminTableInfo[];
+  error?: string;
+}> {
+  return request(`${API_URL}/api/admin/tables`, { headers: authHeaders() });
+}
+
+// Принудительное удаление стола (в т.ч. зависшего во время игры)
+export async function apiAdminDeleteTable(
+  tableId: string
+): Promise<{ ok: boolean; error?: string }> {
+  return request(
+    `${API_URL}/api/admin/tables/delete`,
+    jsonInit("POST", { tableId }, authHeaders())
+  );
+}
+
+// Сброс всей статистики игрока (баланс не трогается)
+export async function apiAdminResetStats(
+  nickname: string
+): Promise<{ ok: boolean; error?: string }> {
+  return request(
+    `${API_URL}/api/admin/reset-stats`,
+    jsonInit("POST", { nickname }, authHeaders())
+  );
+}
+
+// Журнал действий админов. limit опционален (сервер по умолчанию 50)
+export async function apiAdminLog(limit?: number): Promise<{
+  ok: boolean;
+  log?: AdminLogEntry[];
+  error?: string;
+}> {
+  const query = limit ? `?limit=${encodeURIComponent(String(limit))}` : "";
+
+  return request(`${API_URL}/api/admin/log${query}`, { headers: authHeaders() });
+}

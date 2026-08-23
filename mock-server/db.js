@@ -1,4 +1,4 @@
-// Слой постоянного хранения данных (этапы 0–4).
+// Слой постоянного хранения данных (этапы 0–5).
 // Заменяет временные Map/массивы в памяти: пользователи, сессии,
 // платежи, история игр и журнал админ-действий теперь живут в SQLite
 // и переживают перезапуск сервера.
@@ -12,7 +12,7 @@
 //   * CHECK (balance >= 0) в схеме физически запрещает минус;
 //   * единственные пути изменения баланса: processPayment (платежи),
 //     applySpin (слоты) и adjustBalance (ручные операции админа,
-//     подключается на этапе 5). Ни один другой код балансы не трогает.
+//     подключены на этапе 5). Ни один другой код балансы не трогает.
 //
 // История (этап 4): каждая запись помечена источником (колонка source):
 //   "network" — сетевая партия, результат записал сам сервер;
@@ -48,6 +48,7 @@ db.exec(`
   -- CHECK гарантирует: баланс никогда не уйдёт в минус.
   -- Колонки slots_* — отдельная слот-статистика (этапы 0 и 4):
   -- слоты намеренно НЕ увеличивают wins/losses/games_played.
+  -- Колонка role используется админкой (этап 5): 'player' | 'admin'
   CREATE TABLE IF NOT EXISTS users (
     nickname         TEXT PRIMARY KEY,
     nickname_lower   TEXT NOT NULL UNIQUE,
@@ -98,7 +99,8 @@ db.exec(`
     duration_sec  INTEGER NOT NULL DEFAULT 0
   );
 
-  -- Журнал действий админов (этап 5)
+  -- Журнал действий админов (этап 5): кто, что и когда сделал.
+  -- Заполняется всеми изменяющими эндпоинтами /api/admin/*
   CREATE TABLE IF NOT EXISTS admin_log (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     admin   TEXT NOT NULL,
@@ -155,10 +157,20 @@ const stmts = {
     "SELECT * FROM users WHERE nickname_lower = ?"
   ),
 
+  selectAllUsers: db.prepare("SELECT * FROM users ORDER BY created_at ASC"),
+
   // Замена хеша пароля — ленивая миграция открытых паролей (этап 1)
   updateUserPassword: db.prepare(`
     UPDATE users
     SET password_hash = @passwordHash
+    WHERE nickname_lower = @nicknameLower
+  `),
+
+  // Установка роли пользователя (этап 5): 'player' | 'admin'.
+  // Вызывается повышением из списка ADMIN_NICKNAMES
+  updateUserRole: db.prepare(`
+    UPDATE users
+    SET role = @role
     WHERE nickname_lower = @nicknameLower
   `),
 
@@ -195,13 +207,26 @@ const stmts = {
     WHERE nickname_lower = @nicknameLower AND balance >= @bet
   `),
 
-  // Произвольное изменение баланса одной операцией (этап 3):
-  // ручные начисления/списания админа (этап 5). Списание сверх
-  // текущего баланса не применяется (changes === 0)
+  // Произвольное изменение баланса одной операцией (этапы 3 и 5):
+  // ручные начисления/списания админа. Списание сверх текущего
+  // баланса не применяется (changes === 0)
   adjustBalance: db.prepare(`
     UPDATE users
     SET balance = balance + @delta
     WHERE nickname_lower = @nicknameLower AND balance + @delta >= 0
+  `),
+
+  // Сброс ВСЕЙ статистики игрока (этап 5): карточной и слот-статистики.
+  // Баланс намеренно НЕ трогается — это разные вещи
+  resetUserStats: db.prepare(`
+    UPDATE users
+    SET wins            = 0,
+        losses          = 0,
+        games_played    = 0,
+        slots_spins     = 0,
+        slots_bet_total = 0,
+        slots_win_total = 0
+    WHERE nickname_lower = @nicknameLower
   `),
 
   // Контроль целостности: число пользователей с отрицательным
@@ -257,6 +282,11 @@ const stmts = {
     INSERT INTO admin_log (admin, action, details, date)
     VALUES (@admin, @action, @details, @date)
   `),
+
+  // Чтение журнала админ-действий, самые свежие первыми (этап 5)
+  selectAdminLog: db.prepare(
+    "SELECT * FROM admin_log ORDER BY id DESC LIMIT @limit"
+  ),
 };
 
 // Вставка записи истории + подрезка лимита — одна транзакция
@@ -271,6 +301,11 @@ const addHistoryTx = db.transaction(entry => {
 function getUser(nickname) {
   if (typeof nickname !== "string" || nickname === "") return undefined;
   return stmts.selectUserByNickname.get(nickname.toLowerCase());
+}
+
+// Все пользователи подряд — для списка игроков в админке (этап 5)
+function getAllUsers() {
+  return stmts.selectAllUsers.all();
 }
 
 function createUser({ nickname, passwordHash, balance = 0 }) {
@@ -293,6 +328,17 @@ function setUserPassword(nickname, passwordHash) {
     passwordHash,
     nicknameLower: nickname.toLowerCase(),
   });
+}
+
+// Установить роль пользователя (этап 5).
+// Используется повышением ников из ADMIN_NICKNAMES до 'admin'
+function setUserRole(nickname, role) {
+  const result = stmts.updateUserRole.run({
+    role,
+    nicknameLower: nickname.toLowerCase(),
+  });
+
+  return result.changes > 0;
 }
 
 // Результат обычной игры: +1 к gamesPlayed и к wins либо losses.
@@ -318,14 +364,23 @@ function applySpin(nickname, bet, winAmount) {
   return result.changes > 0;
 }
 
-// Атомарное изменение баланса на произвольную дельту (этап 3).
+// Атомарное изменение баланса на произвольную дельту (этапы 3 и 5).
 // Условие balance + @delta >= 0 не даёт уйти в минус даже при
 // параллельных операциях; CHECK-ограничение схемы страхует вдобавок.
-// Обработчиками пока не используется — готовится для ручных
-// начислений/списаний админкой (этап 5)
+// Используется ручным начислением/списанием админа (/api/admin/balance)
 function adjustBalance(nickname, delta) {
   const result = stmts.adjustBalance.run({
     delta,
+    nicknameLower: nickname.toLowerCase(),
+  });
+
+  return result.changes > 0;
+}
+
+// Сбросить всю статистику игрока (этап 5): карточную и слот-статистику.
+// Баланс не затрагивается. Возвращает false, если игрока нет
+function resetUserStats(nickname) {
+  const result = stmts.resetUserStats.run({
     nicknameLower: nickname.toLowerCase(),
   });
 
@@ -479,14 +534,24 @@ function logAdminAction(admin, action, details) {
   });
 }
 
+// Последние действия админов, самые свежие первыми.
+// Лимит ограничивает выборку; вызов без аргумента вернёт пустой список —
+// вызывающий код (server.js) всегда передаёт конкретный лимит
+function getAdminLog(limit) {
+  return stmts.selectAdminLog.all({ limit });
+}
+
 module.exports = {
   db,
   getUser,
   createUser,
   setUserPassword,
+  getAllUsers,
+  setUserRole,
   addGameResult,
   applySpin,
   adjustBalance,
+  resetUserStats,
   countNegativeBalances,
   createSession,
   getSession,
@@ -499,4 +564,5 @@ module.exports = {
   processPayment,
   isUniqueConstraintError,
   logAdminAction,
+  getAdminLog,
 };
