@@ -1,0 +1,565 @@
+/* Шрифт Rubik — подключается до всех остальных правил */
+@import url('https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;600;700&display=swap');
+
+:root {
+  /* Сине-графитовая палитра вместо мёртвого чёрного */
+  --bg-primary: #0e1420;
+  --bg-secondary: #151d2e;
+  --bg-tertiary: #232f47;
+  --text-primary: #e9eef7;
+  --text-secondary: #93a1b8;
+  --accent: #4a9eff;
+  /* Мягкая подложка акцента — для подсветок и активных состояний */
+  --accent-soft: rgba(74, 158, 255, 0.14);
+  --error: #ff4d5e;
+  --success: #46e08b;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Rubik', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  /* Виньетка: лёгкое синее свечение сверху, темнее к краям */
+  background:
+    radial-gradient(1200px 600px at 50% -10%, rgba(74, 158, 255, 0.09), transparent 60%),
+    radial-gradient(ellipse at bottom, #090e18 0%, var(--bg-primary) 65%);
+  background-attachment: fixed;
+  color: var(--text-primary);
+  line-height: 1.6;
+}
+
+/* Цвет выделения текста — в тон акценту */
+::selection {
+  background: rgba(74, 158, 255, 0.35);
+}
+
+/* Кастомный скроллбар: тонкий, тёмный, не выбивается из темы */
+html {
+  scrollbar-width: thin;
+  scrollbar-color: #2c3a57 var(--bg-primary);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-primary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: #2c3a57;
+  border-radius: 999px;
+  border: 2px solid var(--bg-primary);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3a4a6e;
+}
+
+/* Заголовки — чуть плотнее и характернее */
+h1,
+h2,
+h3 {
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem;
+  /* Мягкое появление страницы при переходах между экранами */
+  animation: page-in 0.25s ease-out;
+}
+
+@keyframes page-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ===== Кнопки ===== */
+
+button {
+  background: linear-gradient(180deg, var(--bg-tertiary), #1b2336);
+  color: var(--text-primary);
+  border: 1px solid #2a3650;
+  padding: 0.75rem 1.5rem;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 1rem;
+  font-family: inherit;
+  transition:
+    background 0.2s ease,
+    border-color 0.2s ease,
+    box-shadow 0.2s ease,
+    transform 0.15s ease;
+}
+
+/* Наведение: подъём + свечение акцентом.
+   Исключаем .btn-danger/.btn-primary — у них свои hover-стили ниже */
+button:hover:not(:disabled):not(.btn-danger):not(.btn-primary) {
+  background: linear-gradient(180deg, #2e3c5c, #253049);
+  border-color: var(--accent);
+  box-shadow: 0 0 14px rgba(74, 158, 255, 0.25);
+  transform: translateY(-1px);
+}
+
+/* Тактильное нажатие для всех кнопок */
+button:active:not(:disabled) {
+  transform: translateY(0) scale(0.97);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Главная кнопка действия (Создать, Начать игру и т.п.) */
+.btn-primary {
+  background: linear-gradient(180deg, #5aabff, #3d8de6);
+  border-color: transparent;
+  color: #ffffff;
+  font-weight: 600;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: linear-gradient(180deg, #6fb7ff, #4a9eff);
+  border-color: transparent;
+  box-shadow: 0 4px 18px rgba(74, 158, 255, 0.4);
+  transform: translateY(-1px);
+}
+
+/* ===== Поля ввода ===== */
+
+input,
+select {
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--bg-tertiary);
+  padding: 0.75rem;
+  border-radius: 6px;
+  font-size: 1rem;
+  font-family: inherit;
+  width: 100%;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
+}
+
+input:hover,
+select:hover {
+  border-color: #34425f;
+}
+
+input:focus,
+select:focus {
+  outline: none;
+  border-color: var(--accent);
+  /* Кольцо фокуса вместо простой смены цвета бордера */
+  box-shadow: 0 0 0 3px rgba(74, 158, 255, 0.18);
+}
+
+select {
+  cursor: pointer;
+}
+
+/* Видимый фокус с клавиатуры — доступность навигации */
+button:focus-visible,
+a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.error {
+  color: var(--error);
+  margin-top: 0.5rem;
+}
+
+/* ===== Карточки ===== */
+
+.card {
+  background: var(--bg-secondary);
+  padding: 2rem;
+  border-radius: 10px;
+  border: 1px solid var(--bg-tertiary);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.35);
+  transition:
+    transform 0.2s ease,
+    border-color 0.2s ease,
+    box-shadow 0.2s ease;
+}
+
+/* Подъём и подсветка при наведении.
+   Модальное окно тоже имеет класс .card — его не двигаем */
+.card:not(.modal):hover {
+  transform: translateY(-2px);
+  border-color: rgba(74, 158, 255, 0.45);
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.45),
+    0 0 0 1px rgba(74, 158, 255, 0.12);
+}
+
+.card h2 {
+  margin-bottom: 1rem;
+}
+
+.form-group {
+  margin-bottom: 1rem;
+}
+
+.form-group label {
+  display: block;
+  margin-bottom: 0.5rem;
+  color: var(--text-secondary);
+}
+
+/* ===== Navbar: липкий, с блюром фона ===== */
+
+.navbar {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: rgba(21, 29, 46, 0.82);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  padding: 1rem 2rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid var(--bg-tertiary);
+}
+
+.navbar-brand {
+  font-size: 1.5rem;
+  font-weight: bold;
+  color: var(--accent);
+  text-decoration: none;
+  transition: text-shadow 0.2s ease;
+}
+
+.navbar-brand:hover {
+  text-shadow: 0 0 16px rgba(74, 158, 255, 0.6);
+}
+
+.navbar-links {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+}
+
+.navbar-links a {
+  color: var(--text-primary);
+  text-decoration: none;
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  transition: background 0.2s ease, color 0.2s ease;
+}
+
+.navbar-links a:hover {
+  background: var(--bg-tertiary);
+}
+
+/* Активная ссылка (подключится автоматически после перехода на NavLink) */
+.navbar-links a.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.balance {
+  color: var(--success);
+  font-weight: bold;
+  /* Лёгкое свечение, чтобы баланс читался как «валюта» */
+  text-shadow: 0 0 10px rgba(70, 224, 139, 0.3);
+}
+
+.loading {
+  text-align: center;
+  padding: 2rem;
+  color: var(--text-secondary);
+  animation: loading-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes loading-pulse {
+  50% {
+    opacity: 0.5;
+  }
+}
+
+/* ===== Toast-уведомления ===== */
+
+.toast-container {
+  position: fixed;
+  top: 1rem;
+  right: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  /* Выше модальных окон и оверлеев выбора цвета */
+  z-index: 2000;
+}
+
+.toast {
+  padding: 0.75rem 1.25rem;
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  border: 1px solid var(--bg-tertiary);
+  border-left-width: 4px;
+  min-width: 240px;
+  cursor: pointer;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.55);
+  animation: toast-in 0.2s ease-out;
+  transition: filter 0.15s ease;
+}
+
+.toast:hover {
+  filter: brightness(1.12);
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.toast-success {
+  border-left-color: var(--success);
+}
+
+.toast-error {
+  border-left-color: var(--error);
+}
+
+.toast-info {
+  border-left-color: var(--accent);
+}
+
+/* ===== Модальные окна ===== */
+
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  /* Затемнение + размытие содержимого позади окна */
+  background: rgba(5, 8, 15, 0.72);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1500;
+}
+
+.modal {
+  max-width: 420px;
+  width: 90%;
+  text-align: center;
+  animation: modal-in 0.18s ease-out;
+}
+
+@keyframes modal-in {
+  from {
+    opacity: 0;
+    transform: scale(0.95) translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.modal-actions {
+  display: flex;
+  gap: 1rem;
+  justify-content: center;
+  margin-top: 1.5rem;
+}
+
+/* Опасное действие — красная градиентная кнопка.
+   Идёт ПОСЛЕ общих hover-правил и исключено из них выше */
+.btn-danger {
+  background: linear-gradient(180deg, #ff5a68, #dd3a4c);
+  border-color: transparent;
+  color: #ffffff;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: linear-gradient(180deg, #ff6f7c, #ef4758);
+  border-color: transparent;
+  box-shadow: 0 4px 18px rgba(255, 77, 94, 0.35);
+  transform: translateY(-1px);
+}
+
+/* ===== Индикатор соединения с игровым сервером ===== */
+
+.conn-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.25rem 0.75rem;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  background: var(--bg-secondary);
+  border: 1px solid var(--bg-tertiary);
+  color: var(--text-secondary);
+}
+
+/* Цветная точка статуса */
+.conn-indicator::before {
+  content: "";
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: var(--text-secondary);
+}
+
+.conn-indicator.conn-connected::before {
+  background: var(--success);
+  box-shadow: 0 0 8px rgba(70, 224, 139, 0.7);
+}
+
+.conn-indicator.conn-connecting::before {
+  background: var(--accent);
+  animation: conn-pulse 1s ease-in-out infinite;
+}
+
+.conn-indicator.conn-disconnected::before {
+  background: #f1c40f;
+}
+
+.conn-indicator.conn-failed::before,
+.conn-indicator.conn-local::before {
+  background: var(--text-secondary);
+}
+
+@keyframes conn-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+/* ===== Статистика в профиле ===== */
+
+.stats-grid {
+  display: flex;
+  gap: 1rem;
+}
+
+.stat-box {
+  flex: 1;
+  background: var(--bg-primary);
+  border: 1px solid var(--bg-tertiary);
+  border-radius: 8px;
+  padding: 1rem;
+  text-align: center;
+  transition: border-color 0.2s ease;
+}
+
+.stat-box:hover {
+  border-color: rgba(74, 158, 255, 0.4);
+}
+
+.stat-value {
+  font-size: 1.5rem;
+  font-weight: bold;
+  color: var(--accent);
+}
+
+/* ===== Таблица истории игр ===== */
+
+.history-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.history-table th,
+.history-table td {
+  padding: 0.75rem;
+  text-align: left;
+  border-bottom: 1px solid var(--bg-tertiary);
+}
+
+.history-table th {
+  color: var(--text-secondary);
+  font-weight: normal;
+}
+
+.history-table tbody tr {
+  transition: background 0.15s ease;
+}
+
+.history-table tbody tr:hover {
+  background: rgba(74, 158, 255, 0.06);
+}
+
+/* ===== Адаптив ===== */
+
+@media (max-width: 768px) {
+  .container {
+    padding: 1rem;
+  }
+
+  .navbar {
+    padding: 0.75rem 1rem;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .navbar-brand {
+    font-size: 1.2rem;
+  }
+
+  .navbar-links {
+    flex-wrap: wrap;
+    gap: 0.25rem;
+  }
+
+  .card {
+    padding: 1.25rem;
+  }
+
+  .stats-grid {
+    flex-direction: column;
+  }
+
+  /* Тосты на всю ширину экрана — удобнее читать и закрывать */
+  .toast-container {
+    left: 1rem;
+    right: 1rem;
+  }
+
+  .toast {
+    min-width: 0;
+    width: 100%;
+  }
+}
+
+/* Уважение к системной настройке «меньше анимаций» */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
