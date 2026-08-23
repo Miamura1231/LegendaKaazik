@@ -1,4 +1,4 @@
-// Слой постоянного хранения данных (этап 0).
+// Слой постоянного хранения данных (этапы 0–1).
 // Заменяет временные Map/массивы в памяти: пользователи, сессии,
 // платежи, история игр и журнал админ-действий теперь живут в SQLite
 // и переживают перезапуск сервера.
@@ -28,8 +28,10 @@ db.pragma("foreign_keys = ON");
 // ===== Схема =====
 
 db.exec(`
-  -- Игроки. До этапа 1 пароль хранится в открытом виде в password_hash
-  -- (имя колонки задано заранее под будущий bcrypt-хеш).
+  -- Игроки. Пароли хранятся ТОЛЬКО как bcrypt-хеши (этап 1).
+  -- Записи, созданные на этапе 0 с открытым паролем, мигрируют
+  -- лениво: при первом успешном входе хеш перезаписывается
+  -- (см. auth.js и /api/auth/login в server.js).
   -- CHECK гарантирует: баланс никогда не уйдёт в минус.
   CREATE TABLE IF NOT EXISTS users (
     nickname         TEXT PRIMARY KEY,
@@ -92,8 +94,8 @@ db.exec(`
 // ===== Константы =====
 
 // Время жизни сессии: 30 дней.
-// Этап 1 добавит периодическую очистку просроченных
-// и сброс всех сессий игрока
+// Просроченные сессии отклоняются при каждом чтении (getSession),
+// а фоновая чистка таблицы запускается из server.js
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 // Сколько последних игр хранится в истории (как раньше в памяти)
@@ -110,6 +112,13 @@ const stmts = {
   selectUserByNickname: db.prepare(
     "SELECT * FROM users WHERE nickname_lower = ?"
   ),
+
+  // Замена хеша пароля — ленивая миграция открытых паролей (этап 1)
+  updateUserPassword: db.prepare(`
+    UPDATE users
+    SET password_hash = @passwordHash
+    WHERE nickname_lower = @nicknameLower
+  `),
 
   applyPayment: db.prepare(`
     UPDATE users
@@ -148,6 +157,11 @@ const stmts = {
   deleteSession: db.prepare("DELETE FROM sessions WHERE token = ?"),
 
   deleteUserSessions: db.prepare("DELETE FROM sessions WHERE nickname = ?"),
+
+  // Массовая чистка просроченных сессий (фон, этап 1)
+  deleteExpiredSessions: db.prepare(
+    "DELETE FROM sessions WHERE expires_at <= ?"
+  ),
 
   insertHistory: db.prepare(`
     INSERT INTO history (id, game_type, winner, players_json, date, duration_sec)
@@ -205,6 +219,16 @@ function createUser({ nickname, passwordHash, balance = 0 }) {
   });
 
   return getUser(nickname);
+}
+
+// Перезаписать хеш пароля игрока.
+// Используется для ленивой миграции открытых паролей этапа 0:
+// первый успешный вход со старой записью превращает её в bcrypt-хеш
+function setUserPassword(nickname, passwordHash) {
+  stmts.updateUserPassword.run({
+    passwordHash,
+    nicknameLower: nickname.toLowerCase(),
+  });
 }
 
 // Начисление платежа одной операцией
@@ -275,9 +299,17 @@ function deleteSession(token) {
 }
 
 // Сброс всех сессий игрока («выйти со всех устройств»).
-// Эндпоинт будет подключён на этапе 1
+// Используется эндпоинтом POST /api/auth/logout-all (этап 1)
 function deleteUserSessions(nickname) {
   stmts.deleteUserSessions.run(nickname);
+}
+
+// Удалить ВСЕ просроченные сессии одним запросом.
+// Вызывается при старте сервера и затем по таймеру (server.js);
+// корректность конкретной сессии в любом случае проверяется
+// по expires_at при каждом чтении в getSession
+function deleteExpiredSessions() {
+  stmts.deleteExpiredSessions.run(new Date().toISOString());
 }
 
 // ===== История =====
@@ -338,6 +370,7 @@ module.exports = {
   db,
   getUser,
   createUser,
+  setUserPassword,
   applyPayment,
   addGameResult,
   applySpin,
@@ -345,6 +378,7 @@ module.exports = {
   getSession,
   deleteSession,
   deleteUserSessions,
+  deleteExpiredSessions,
   addHistoryEntry,
   getHistory,
   isEventProcessed,

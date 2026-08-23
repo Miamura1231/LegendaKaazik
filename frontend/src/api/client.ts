@@ -107,8 +107,22 @@ export async function apiLogout(): Promise<void> {
   clearToken();
 }
 
+// Выход со ВСЕХ устройств: сервер удаляет все сессии игрока,
+// включая текущую. Локальный токен очищается как обычно.
+// Кнопка «Выйти со всех устройств» подключается на странице профиля
+export async function apiLogoutAll(): Promise<void> {
+  await request(`${API_URL}/api/auth/logout-all`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+
+  clearToken();
+}
+
 export async function apiLobby(): Promise<LobbyResponse> {
-  return request(`${API_URL}/api/lobby`);
+  // Список столов требует сессию: с этапа 1 все /api-эндпоинты
+  // закрыты токеном, кроме логина и платёжного эндпоинта Minecraft
+  return request(`${API_URL}/api/lobby`, { headers: authHeaders() });
 }
 
 // difficulty опционален: в режиме "только игроки" сложность ботов

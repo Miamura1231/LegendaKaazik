@@ -34,9 +34,18 @@ const {
   createSession,
   getSession,
   deleteSession,
+  deleteUserSessions,
+  setUserPassword,
+  deleteExpiredSessions,
   addHistoryEntry,
   getHistory,
 } = require("./db");
+// Хеширование и проверка паролей (этап 1)
+const {
+  hashPassword,
+  verifyPassword,
+  isBcryptHash,
+} = require("./auth");
 
 const app = express();
 app.use(cors());
@@ -49,6 +58,51 @@ app.use(express.json());
 const DIST_DIR = path.join(__dirname, "..", "frontend", "dist");
 
 app.use(express.static(DIST_DIR));
+
+// ===== Авторизация REST API (этап 1) =====
+//
+// Все /api-эндпоинты закрыты проверкой Bearer-токена, КРОМЕ двух
+// публичных:
+//   * /api/auth/login         — вход, токена ещё нет по определению;
+//   * /api/minecraft/payment  — у Fabric-считывателя нет токена сайта
+//                               (защита секретным ключом — этап 2).
+//
+// WebSocket (/ws) проверяется отдельно при рукопожатии — см.
+// wss.on("connection"): express-middleware на upgrade-запросы
+// не вызывается.
+//
+// Статика и SPA-fallback остаются публичными: это просто файлы
+// собранного фронтенда, секретов в них нет.
+//
+// Прошедшим проверку обработчикам доступны:
+//   req.sessionNickname — ник игрока из сессии;
+//   req.sessionToken    — сам токен (нужен для выхода).
+const PUBLIC_API_PATHS = new Set([
+  "/api/auth/login",
+  "/api/minecraft/payment",
+]);
+
+app.use((req, res, next) => {
+  // Не API-пути (статика, страницы) пропускаем без проверки
+  if (!req.path.startsWith("/api")) return next();
+
+  // Публичные эндпоинты пропускаем без проверки
+  if (PUBLIC_API_PATHS.has(req.path)) return next();
+
+  const token = req.headers.authorization?.replace("Bearer ", "");
+  const session = getSession(token);
+
+  if (!session) {
+    return res.status(401).json({
+      ok: false,
+      error: "Нет сессии",
+    });
+  }
+
+  req.sessionNickname = session.nickname;
+  req.sessionToken = token;
+  next();
+});
 
 const PORT = 3001;
 
@@ -76,7 +130,8 @@ const ERROR_RESULTS = new Set([
 ]);
 
 // Пользователи, сессии, история, платежи и журнал админ-действий
-// хранятся в SQLite — см. ./db (этап 0)
+// хранятся в SQLite — см. ./db (этап 0); пароли — только bcrypt-хеши
+// (этап 1, см. ./auth)
 
 // Допустимые сложности ботов
 const ALLOWED_DIFFICULTIES = ["easy", "medium", "hard"];
@@ -164,13 +219,6 @@ function safeUser(user) {
       gamesPlayed: user.games_played,
     },
   };
-}
-
-// Ник пользователя сессии из заголовка Authorization (или null)
-function getSessionNickname(req) {
-  const token = req.headers.authorization?.replace("Bearer ", "");
-  const session = getSession(token);
-  return session ? session.nickname : null;
 }
 
 // Актуальный статус стола, вычисляемый из живой комнаты.
@@ -683,6 +731,7 @@ const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws, req) => {
   // Токен сессии передаётся в query-string: /ws?token=...
+  // Срок жизни токена учитывается getSession автоматически (этап 1)
   const url = new URL(req.url, "http://localhost");
   const token = url.searchParams.get("token");
   const session = token ? getSession(token) : null;
@@ -731,6 +780,13 @@ wss.on("connection", (ws, req) => {
 // ===== REST API =====
 
 // Сюда будет обращаться Fabric-считыватель.
+// Эндпоинт публичный (без токена сайта): подлинность запросов будет
+// обеспечиваться секретным ключом/подписью на этапе 2.
+//
+// Пароль аккаунта генерируется здесь и показывается игроку РОВНО ОДИН
+// раз — при создании. В БД попадает только bcrypt-хеш, восстановить
+// пароль из него невозможно, поэтому при повторных переводах
+// существующему игроку password/tellMessage приходят как null
 app.post("/api/minecraft/payment", (req, res) => {
   const { nickname, amount, currency, rawMessage, eventId } = req.body || {};
 
@@ -753,17 +809,16 @@ app.post("/api/minecraft/payment", (req, res) => {
   let user = getUser(nickname);
 
   let created = false;
+  // Открытый пароль живёт только в момент создания аккаунта
+  let plainPassword = null;
 
   if (!user) {
     created = true;
+    plainPassword = generatePassword();
 
-    // ВАЖНО: до этапа 1 пароль хранится в открытом виде.
-    // Колонка называется password_hash заранее — этап 1 положит
-    // туда bcrypt-хеш и изменит этот поток (пароль показывается
-    // игроку один раз, при создании аккаунта)
     user = createUser({
       nickname,
-      passwordHash: generatePassword(),
+      passwordHash: hashPassword(plainPassword),
     });
   }
 
@@ -773,7 +828,9 @@ app.post("/api/minecraft/payment", (req, res) => {
   // Перечитываем актуальные баланс и данные
   user = getUser(nickname);
 
-  const tellMessage = `Твой пароль от сайта: ${user.password_hash}`;
+  const tellMessage = created
+    ? `Твой пароль от сайта: ${plainPassword}`
+    : null;
 
   console.log("[PAYMENT]", {
     nickname,
@@ -790,7 +847,8 @@ app.post("/api/minecraft/payment", (req, res) => {
     created,
     nickname: user.nickname,
     balance: user.balance,
-    password: user.password_hash,
+    // Пароль отдаётся только при создании аккаунта, иначе null
+    password: created ? plainPassword : null,
     tellMessage,
   });
 });
@@ -815,12 +873,21 @@ app.post("/api/auth/login", (req, res) => {
     });
   }
 
-  // Этап 1 заменит прямое сравнение на bcrypt.compare
-  if (user.password_hash !== password) {
+  // Проверка пароля против bcrypt-хеша. Старые записи с открытым
+  // паролем (созданы на этапе 0) сравниваются напрямую
+  if (!verifyPassword(user.password_hash, password)) {
     return res.status(401).json({
       ok: false,
       error: "Неверный пароль",
     });
+  }
+
+  // Ленивая миграция: если в базе ещё лежал открытый пароль —
+  // заменяем его хешем при первом же успешном входе.
+  // Так база переезжает на хеши сама, без отдельного скрипта
+  if (!isBcryptHash(user.password_hash)) {
+    setUserPassword(user.nickname, hashPassword(password));
+    console.log(`[AUTH] Пароль игрока ${user.nickname} переведён в bcrypt-хеш`);
   }
 
   const token = generateToken();
@@ -835,18 +902,9 @@ app.post("/api/auth/login", (req, res) => {
 });
 
 // Проверка сессии и получение профиля.
+// Сессия уже проверена middleware (этап 1)
 app.get("/api/me", (req, res) => {
-  const token = req.headers.authorization?.replace("Bearer ", "");
-  const session = getSession(token);
-
-  if (!session) {
-    return res.status(401).json({
-      ok: false,
-      error: "Нет сессии",
-    });
-  }
-
-  const user = getUser(session.nickname);
+  const user = getUser(req.sessionNickname);
 
   if (!user) {
     return res.status(404).json({
@@ -861,11 +919,24 @@ app.get("/api/me", (req, res) => {
   });
 });
 
-// Выход.
+// Выход: удаляется только ТЕКУЩАЯ сессия (токен из заголовка).
+// Для выхода со всех устройств есть /api/auth/logout-all
 app.post("/api/auth/logout", (req, res) => {
-  const token = req.headers.authorization?.replace("Bearer ", "");
+  deleteSession(req.sessionToken);
 
-  deleteSession(token);
+  return res.json({
+    ok: true,
+  });
+});
+
+// Выход со ВСЕХ устройств: удаляются все сессии игрока, включая
+// текущую. Токены на других устройствах перестают работать сразу,
+// а активные WebSocket-соединения отваливаются при следующем
+// обращении к getSession
+app.post("/api/auth/logout-all", (req, res) => {
+  deleteUserSessions(req.sessionNickname);
+
+  console.log(`[AUTH] ${req.sessionNickname} завершил все свои сессии`);
 
   return res.json({
     ok: true,
@@ -873,7 +944,8 @@ app.post("/api/auth/logout", (req, res) => {
 });
 
 // Лобби: количество игроков, статус и момент автоудаления берём
-// из актуального состояния, чтобы список всегда отражал реальность
+// из актуального состояния, чтобы список всегда отражал реальность.
+// Доступ только с валидной сессией (middleware, этап 1)
 app.get("/api/lobby", (req, res) => {
   return res.json({
     ok: true,
@@ -883,14 +955,8 @@ app.get("/api/lobby", (req, res) => {
 
 // Создание стола в лобби.
 app.post("/api/lobby/create", (req, res) => {
-  const nickname = getSessionNickname(req);
-
-  if (!nickname) {
-    return res.status(401).json({
-      ok: false,
-      error: "Нет сессии",
-    });
-  }
+  // Сессия уже проверена middleware (этап 1)
+  const nickname = req.sessionNickname;
 
   const { name, minAmount, difficulty, mode, password, game } = req.body || {};
 
@@ -961,14 +1027,7 @@ app.post("/api/lobby/create", (req, res) => {
 // Проверка возможности входа за стол (пароль, статус, вместимость).
 // Реальную посадку выполняет WebSocket-join на странице игры.
 app.post("/api/lobby/join", (req, res) => {
-  const nickname = getSessionNickname(req);
-
-  if (!nickname) {
-    return res.status(401).json({
-      ok: false,
-      error: "Нет сессии",
-    });
-  }
+  const nickname = req.sessionNickname;
 
   const { tableId, password } = req.body || {};
 
@@ -1033,14 +1092,7 @@ app.post("/api/lobby/join", (req, res) => {
 
 // Создатель запускает партию в режиме "players" (для любой игры)
 app.post("/api/lobby/start", (req, res) => {
-  const nickname = getSessionNickname(req);
-
-  if (!nickname) {
-    return res.status(401).json({
-      ok: false,
-      error: "Нет сессии",
-    });
-  }
+  const nickname = req.sessionNickname;
 
   const { tableId } = req.body || {};
 
@@ -1115,14 +1167,7 @@ app.post("/api/lobby/start", (req, res) => {
 
 // Удаление стола создателем (только до начала игры)
 app.post("/api/lobby/delete", (req, res) => {
-  const nickname = getSessionNickname(req);
-
-  if (!nickname) {
-    return res.status(401).json({
-      ok: false,
-      error: "Нет сессии",
-    });
-  }
+  const nickname = req.sessionNickname;
 
   const { tableId } = req.body || {};
 
@@ -1168,14 +1213,7 @@ app.post("/api/lobby/delete", (req, res) => {
 
 // Кик игрока со стола (только создатель)
 app.post("/api/lobby/kick", (req, res) => {
-  const nickname = getSessionNickname(req);
-
-  if (!nickname) {
-    return res.status(401).json({
-      ok: false,
-      error: "Нет сессии",
-    });
-  }
+  const nickname = req.sessionNickname;
 
   const { tableId, playerNickname } = req.body || {};
 
@@ -1263,14 +1301,7 @@ app.post("/api/lobby/kick", (req, res) => {
 // Используется клиентом для: обнаружения кика, экрана ожидания,
 // списка игроков, определения прав создателя и типа игры
 app.get("/api/lobby/my-table", (req, res) => {
-  const nickname = getSessionNickname(req);
-
-  if (!nickname) {
-    return res.status(401).json({
-      ok: false,
-      error: "Нет сессии",
-    });
-  }
+  const nickname = req.sessionNickname;
 
   for (const [tableId, room] of games) {
     if (!room.humans.has(nickname)) continue;
@@ -1303,14 +1334,7 @@ app.get("/api/lobby/my-table", (req, res) => {
 // Прокрутка слотов. Баланс меняет только сервер одной операцией;
 // статистика wins/losses/gamesPlayed слотами НЕ затрагивается
 app.post("/api/slots/spin", (req, res) => {
-  const nickname = getSessionNickname(req);
-
-  if (!nickname) {
-    return res.status(401).json({
-      ok: false,
-      error: "Нет сессии",
-    });
-  }
+  const nickname = req.sessionNickname;
 
   const { bet } = req.body || {};
   const parsedBet = Number(bet);
@@ -1394,17 +1418,9 @@ app.post("/api/slots/spin", (req, res) => {
 // Результат завершённой ЛОКАЛЬНОЙ игры (fallback-режим клиента УНО).
 // Сетевые партии сервер записывает сам в recordResults().
 app.post("/api/game/result", (req, res) => {
-  const token = req.headers.authorization?.replace("Bearer ", "");
-  const session = getSession(token);
+  const nickname = req.sessionNickname;
 
-  if (!session) {
-    return res.status(401).json({
-      ok: false,
-      error: "Нет сессии",
-    });
-  }
-
-  const user = getUser(session.nickname);
+  const user = getUser(nickname);
 
   if (!user) {
     return res.status(404).json({
@@ -1441,7 +1457,7 @@ app.post("/api/game/result", (req, res) => {
   // иначе любой клиент мог бы накрутить статистику кому угодно
   addGameResult(
     user.nickname,
-    winner.toLowerCase() === session.nickname.toLowerCase()
+    winner.toLowerCase() === nickname.toLowerCase()
   );
 
   addHistoryEntry({
@@ -1453,7 +1469,7 @@ app.post("/api/game/result", (req, res) => {
     durationSec: duration,
   });
 
-  const updated = getUser(session.nickname);
+  const updated = getUser(nickname);
 
   return res.json({
     ok: true,
@@ -1466,17 +1482,8 @@ app.post("/api/game/result", (req, res) => {
 });
 
 // История последних игр.
+// Доступ только с валидной сессией (middleware, этап 1)
 app.get("/api/history", (req, res) => {
-  const token = req.headers.authorization?.replace("Bearer ", "");
-  const session = getSession(token);
-
-  if (!session) {
-    return res.status(401).json({
-      ok: false,
-      error: "Нет сессии",
-    });
-  }
-
   return res.json({
     ok: true,
     history: getHistory(),
@@ -1529,6 +1536,13 @@ setInterval(() => {
     return true;
   });
 }, AUTO_DELETE_CHECK_MS);
+
+// Очистка просроченных сессий (этап 1): сразу при старте и затем
+// каждый час. Корректность конкретной сессии в любом случае
+// проверяется по expires_at при каждом чтении (getSession),
+// фоновая чистка лишь не даёт таблице sessions распухать
+deleteExpiredSessions();
+setInterval(deleteExpiredSessions, 60 * 60 * 1000);
 
 server.listen(PORT, () => {
   console.log(`Mock server running on http://localhost:${PORT}`);
