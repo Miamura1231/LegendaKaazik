@@ -24,6 +24,19 @@ const {
   makeDurakBotMove,
   DURAK_ERROR_RESULTS,
 } = require("./durakEngine");
+// Постоянное хранилище: SQLite вместо Map в памяти (этап 0)
+const {
+  getUser,
+  createUser,
+  applyPayment,
+  addGameResult,
+  applySpin,
+  createSession,
+  getSession,
+  deleteSession,
+  addHistoryEntry,
+  getHistory,
+} = require("./db");
 
 const app = express();
 app.use(cors());
@@ -62,13 +75,8 @@ const ERROR_RESULTS = new Set([
   "Эту карту нельзя сыграть",
 ]);
 
-// Временное хранилище данных.
-// Потом это заменит настоящий бэкенд.
-const users = new Map();
-const sessions = new Map();
-
-// История последних игр (максимум 10, самые свежие в начале)
-const history = [];
+// Пользователи, сессии, история, платежи и журнал админ-действий
+// хранятся в SQLite — см. ./db (этап 0)
 
 // Допустимые сложности ботов
 const ALLOWED_DIFFICULTIES = ["easy", "medium", "hard"];
@@ -141,22 +149,28 @@ function generateToken() {
   return crypto.randomBytes(24).toString("hex");
 }
 
+// Публичное представление пользователя для клиента.
+// На входе — строка из БД (плоские колонки), на выходе — прежняя
+// форма ответа API, чтобы фронтенд не менялся
 function safeUser(user) {
   return {
     nickname: user.nickname,
     balance: user.balance,
-    createdAt: user.createdAt,
-    lastPaymentAt: user.lastPaymentAt,
-    // Fallback для пользователей, созданных до появления статистики
-    stats: user.stats || { wins: 0, losses: 0, gamesPlayed: 0 },
+    createdAt: user.created_at,
+    lastPaymentAt: user.last_payment_at,
+    stats: {
+      wins: user.wins,
+      losses: user.losses,
+      gamesPlayed: user.games_played,
+    },
   };
 }
 
 // Ник пользователя сессии из заголовка Authorization (или null)
 function getSessionNickname(req) {
   const token = req.headers.authorization?.replace("Bearer ", "");
-  if (!token || !sessions.has(token)) return null;
-  return sessions.get(token).nickname;
+  const session = getSession(token);
+  return session ? session.nickname : null;
 }
 
 // Актуальный статус стола, вычисляемый из живой комнаты.
@@ -339,33 +353,25 @@ function recordResults(room) {
     Math.round((Date.now() - room.startedAt) / 1000)
   );
 
+  // Статистика обновляется прямо в БД, по одному человеку за раз
   for (const nickname of room.humans.keys()) {
-    const user = users.get(nickname.toLowerCase());
+    const user = getUser(nickname);
     if (!user) continue;
 
-    if (!user.stats) {
-      user.stats = { wins: 0, losses: 0, gamesPlayed: 0 };
-    }
-
-    user.stats.gamesPlayed += 1;
-
-    if (winner.toLowerCase() === nickname.toLowerCase()) {
-      user.stats.wins += 1;
-    } else {
-      user.stats.losses += 1;
-    }
+    addGameResult(
+      user.nickname,
+      winner.toLowerCase() === nickname.toLowerCase()
+    );
   }
 
-  history.unshift({
+  addHistoryEntry({
     id: `game-${Date.now()}`,
+    gameType: room.game || "uno",
     winner,
     players,
     date: new Date().toISOString(),
     durationSec,
   });
-  if (history.length > 10) {
-    history.pop();
-  }
 
   console.log("[GAME FINISHED]", { tableId: room.tableId, game: room.game, winner, durationSec });
 }
@@ -679,7 +685,7 @@ wss.on("connection", (ws, req) => {
   // Токен сессии передаётся в query-string: /ws?token=...
   const url = new URL(req.url, "http://localhost");
   const token = url.searchParams.get("token");
-  const session = token ? sessions.get(token) : null;
+  const session = token ? getSession(token) : null;
 
   if (!session) {
     sendTo(ws, { type: "error", message: "Нет сессии. Войди заново" });
@@ -744,30 +750,30 @@ app.post("/api/minecraft/payment", (req, res) => {
     });
   }
 
-  const key = nickname.toLowerCase();
-  let user = users.get(key);
+  let user = getUser(nickname);
 
   let created = false;
 
   if (!user) {
     created = true;
 
-    user = {
+    // ВАЖНО: до этапа 1 пароль хранится в открытом виде.
+    // Колонка называется password_hash заранее — этап 1 положит
+    // туда bcrypt-хеш и изменит этот поток (пароль показывается
+    // игроку один раз, при создании аккаунта)
+    user = createUser({
       nickname,
-      password: generatePassword(),
-      balance: 0,
-      createdAt: new Date().toISOString(),
-      lastPaymentAt: null,
-      stats: { wins: 0, losses: 0, gamesPlayed: 0 },
-    };
-
-    users.set(key, user);
+      passwordHash: generatePassword(),
+    });
   }
 
-  user.balance += parsedAmount;
-  user.lastPaymentAt = new Date().toISOString();
+  // Начисление одной атомарной операцией в БД
+  applyPayment(user.nickname, parsedAmount);
 
-  const tellMessage = `Твой пароль от сайта: ${user.password}`;
+  // Перечитываем актуальные баланс и данные
+  user = getUser(nickname);
+
+  const tellMessage = `Твой пароль от сайта: ${user.password_hash}`;
 
   console.log("[PAYMENT]", {
     nickname,
@@ -784,7 +790,7 @@ app.post("/api/minecraft/payment", (req, res) => {
     created,
     nickname: user.nickname,
     balance: user.balance,
-    password: user.password,
+    password: user.password_hash,
     tellMessage,
   });
 });
@@ -800,7 +806,7 @@ app.post("/api/auth/login", (req, res) => {
     });
   }
 
-  const user = users.get(nickname.toLowerCase());
+  const user = getUser(nickname);
 
   if (!user) {
     return res.status(404).json({
@@ -809,7 +815,8 @@ app.post("/api/auth/login", (req, res) => {
     });
   }
 
-  if (user.password !== password) {
+  // Этап 1 заменит прямое сравнение на bcrypt.compare
+  if (user.password_hash !== password) {
     return res.status(401).json({
       ok: false,
       error: "Неверный пароль",
@@ -818,10 +825,7 @@ app.post("/api/auth/login", (req, res) => {
 
   const token = generateToken();
 
-  sessions.set(token, {
-    nickname: user.nickname,
-    createdAt: new Date().toISOString(),
-  });
+  createSession(user.nickname, token);
 
   return res.json({
     ok: true,
@@ -833,16 +837,16 @@ app.post("/api/auth/login", (req, res) => {
 // Проверка сессии и получение профиля.
 app.get("/api/me", (req, res) => {
   const token = req.headers.authorization?.replace("Bearer ", "");
+  const session = getSession(token);
 
-  if (!token || !sessions.has(token)) {
+  if (!session) {
     return res.status(401).json({
       ok: false,
       error: "Нет сессии",
     });
   }
 
-  const session = sessions.get(token);
-  const user = users.get(session.nickname.toLowerCase());
+  const user = getUser(session.nickname);
 
   if (!user) {
     return res.status(404).json({
@@ -861,9 +865,7 @@ app.get("/api/me", (req, res) => {
 app.post("/api/auth/logout", (req, res) => {
   const token = req.headers.authorization?.replace("Bearer ", "");
 
-  if (token) {
-    sessions.delete(token);
-  }
+  deleteSession(token);
 
   return res.json({
     ok: true,
@@ -1320,7 +1322,7 @@ app.post("/api/slots/spin", (req, res) => {
     });
   }
 
-  const user = users.get(nickname.toLowerCase());
+  const user = getUser(nickname);
 
   if (!user) {
     return res.status(404).json({
@@ -1329,9 +1331,9 @@ app.post("/api/slots/spin", (req, res) => {
     });
   }
 
-  // Атомарность обеспечивается синхронностью: списание и начисление
-  // происходят в одном обработчике без промежуточных await,
-  // поэтому параллельные запросы не могут создать гонку
+  // Быстрая проверка ради понятного сообщения об ошибке;
+  // финальная гарантия — условие balance >= bet внутри
+  // атомарного UPDATE (см. applySpin в db.js)
   if (parsedBet > user.balance) {
     return res.status(400).json({
       ok: false,
@@ -1359,22 +1361,33 @@ app.post("/api/slots/spin", (req, res) => {
     winAmount = parsedBet * 2;
   }
 
-  // Списание ставки и начисление выигрыша одной операцией
-  user.balance = user.balance - parsedBet + winAmount;
+  // Списание ставки, начисление выигрыша и накопительная слот-статистика —
+  // один атомарный UPDATE. Если из-за гонки быстрых кликов баланса
+  // уже не хватает, changes === 0 и запрос отклоняется
+  const applied = applySpin(user.nickname, parsedBet, winAmount);
+
+  if (!applied) {
+    return res.status(400).json({
+      ok: false,
+      error: "Недостаточно средств",
+    });
+  }
+
+  const updated = getUser(nickname);
 
   console.log("[SLOTS]", {
     nickname,
     bet: parsedBet,
     reels,
     winAmount,
-    newBalance: user.balance,
+    newBalance: updated.balance,
   });
 
   return res.json({
     ok: true,
     reels,
     winAmount,
-    newBalance: user.balance,
+    newBalance: updated.balance,
   });
 });
 
@@ -1382,16 +1395,16 @@ app.post("/api/slots/spin", (req, res) => {
 // Сетевые партии сервер записывает сам в recordResults().
 app.post("/api/game/result", (req, res) => {
   const token = req.headers.authorization?.replace("Bearer ", "");
+  const session = getSession(token);
 
-  if (!token || !sessions.has(token)) {
+  if (!session) {
     return res.status(401).json({
       ok: false,
       error: "Нет сессии",
     });
   }
 
-  const session = sessions.get(token);
-  const user = users.get(session.nickname.toLowerCase());
+  const user = getUser(session.nickname);
 
   if (!user) {
     return res.status(404).json({
@@ -1426,42 +1439,38 @@ app.post("/api/game/result", (req, res) => {
 
   // Ник берём из сессии, а не из тела запроса —
   // иначе любой клиент мог бы накрутить статистику кому угодно
-  if (!user.stats) {
-    user.stats = { wins: 0, losses: 0, gamesPlayed: 0 };
-  }
+  addGameResult(
+    user.nickname,
+    winner.toLowerCase() === session.nickname.toLowerCase()
+  );
 
-  user.stats.gamesPlayed += 1;
-
-  if (winner.toLowerCase() === session.nickname.toLowerCase()) {
-    user.stats.wins += 1;
-  } else {
-    user.stats.losses += 1;
-  }
-
-  const entry = {
+  addHistoryEntry({
     id: `game-${Date.now()}`,
+    gameType: "uno",
     winner,
     players,
     date: new Date().toISOString(),
     durationSec: duration,
-  };
+  });
 
-  history.unshift(entry);
-  if (history.length > 10) {
-    history.pop();
-  }
+  const updated = getUser(session.nickname);
 
   return res.json({
     ok: true,
-    stats: user.stats,
+    stats: {
+      wins: updated.wins,
+      losses: updated.losses,
+      gamesPlayed: updated.games_played,
+    },
   });
 });
 
 // История последних игр.
 app.get("/api/history", (req, res) => {
   const token = req.headers.authorization?.replace("Bearer ", "");
+  const session = getSession(token);
 
-  if (!token || !sessions.has(token)) {
+  if (!session) {
     return res.status(401).json({
       ok: false,
       error: "Нет сессии",
@@ -1470,7 +1479,7 @@ app.get("/api/history", (req, res) => {
 
   return res.json({
     ok: true,
-    history,
+    history: getHistory(),
   });
 });
 
