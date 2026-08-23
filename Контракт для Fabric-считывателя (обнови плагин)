@@ -1,0 +1,6 @@
+POST /api/minecraft/payment
+Headers:
+  Content-Type: application/json
+  x-payment-key: dev-only-secret-change-on-vps
+Body:
+  {"nickname":"Ник","amount":100,"currency":"RUB","rawMessage":"...","eventId":"transfer-12345"}

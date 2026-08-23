@@ -39,6 +39,9 @@ const {
   deleteExpiredSessions,
   addHistoryEntry,
   getHistory,
+  // Идемпотентность платежей (этап 2)
+  isEventProcessed,
+  markEventProcessed,
 } = require("./db");
 // Хеширование и проверка паролей (этап 1)
 const {
@@ -46,6 +49,10 @@ const {
   verifyPassword,
   isBcryptHash,
 } = require("./auth");
+// Защита платёжного эндпоинта — заглушка с секретным ключом (этап 2)
+const {
+  verifyPaymentRequest,
+} = require("./paymentSecurity");
 
 const app = express();
 app.use(cors());
@@ -64,8 +71,10 @@ app.use(express.static(DIST_DIR));
 // Все /api-эндпоинты закрыты проверкой Bearer-токена, КРОМЕ двух
 // публичных:
 //   * /api/auth/login         — вход, токена ещё нет по определению;
-//   * /api/minecraft/payment  — у Fabric-считывателя нет токена сайта
-//                               (защита секретным ключом — этап 2).
+//   * /api/minecraft/payment  — у Fabric-считывателя нет токена сайта;
+//                               подлинность запросов обеспечивается
+//                               секретным ключом (см. ./paymentSecurity,
+//                               этап 2).
 //
 // WebSocket (/ws) проверяется отдельно при рукопожатии — см.
 // wss.on("connection"): express-middleware на upgrade-запросы
@@ -120,6 +129,9 @@ const SLOT_MIN_BET = 10;
 // Символы барабанов. 7 символов: вероятность трёх одинаковых ~0.9%,
 // двух одинаковых ~37%; выплаты x10/x2 дают матожидание ~0.82 ставки
 const SLOT_SYMBOLS = ["🍒", "🍋", "🔔", "💎", "⭐", "🍀", "7"];
+
+// Настройки платежей Minecraft (этап 2)
+const PAYMENT_MIN_AMOUNT = 10; // минимальная сумма одного перевода
 
 // Сообщения движка УНО, означающие отклонённое действие.
 // В этом случае состояние НЕ применяется, а ошибка уходит только отправителю.
@@ -779,15 +791,41 @@ wss.on("connection", (ws, req) => {
 
 // ===== REST API =====
 
-// Сюда будет обращаться Fabric-считыватель.
-// Эндпоинт публичный (без токена сайта): подлинность запросов будет
-// обеспечиваться секретным ключом/подписью на этапе 2.
+// Приём переводов из Minecraft (этап 2).
+//
+// Формат запроса от Fabric-считывателя:
+//   POST /api/minecraft/payment
+//   Заголовки:
+//     Content-Type: application/json
+//     x-payment-key: <секретный ключ>   (см. ./paymentSecurity)
+//   Тело JSON:
+//     {
+//       "nickname": "НикИгрока",  // ник в Minecraft = логин на сайте
+//       "amount": 100,            // целое число, минимум 10
+//       "currency": "RUB",        // опционально, только для журнала
+//       "rawMessage": "...",      // опционально, исходный текст чата
+//       "eventId": "уникальный"   // ОБЯЗАТЕЛЕН, уникален для каждого перевода
+//     }
+//
+// Идемпотентность: если eventId уже обрабатывался, деньги НЕ начисляются
+// повторно — возвращается ok: true и duplicate: true с текущим балансом.
+// Это защищает от повторной доставки сообщения считывателем (ретраи,
+// перезапуски плагина, дубли в очереди и т.п.).
 //
 // Пароль аккаунта генерируется здесь и показывается игроку РОВНО ОДИН
 // раз — при создании. В БД попадает только bcrypt-хеш, восстановить
 // пароль из него невозможно, поэтому при повторных переводах
 // существующему игроку password/tellMessage приходят как null
 app.post("/api/minecraft/payment", (req, res) => {
+  // --- Шаг 1. Секретный ключ (заглушка, этап 2) ---
+  if (!verifyPaymentRequest(req)) {
+    console.warn("[PAYMENT] Отклонён запрос: неверный секретный ключ");
+    return res.status(401).json({
+      ok: false,
+      error: "Bad payment key",
+    });
+  }
+
   const { nickname, amount, currency, rawMessage, eventId } = req.body || {};
 
   if (!nickname || typeof nickname !== "string") {
@@ -803,6 +841,44 @@ app.post("/api/minecraft/payment", (req, res) => {
     return res.status(400).json({
       ok: false,
       error: "Bad amount",
+    });
+  }
+
+  // --- Шаг 2. Минимальная сумма перевода ---
+  if (parsedAmount < PAYMENT_MIN_AMOUNT) {
+    return res.status(400).json({
+      ok: false,
+      error: `Minimum amount is ${PAYMENT_MIN_AMOUNT}`,
+    });
+  }
+
+  // --- Шаг 3. eventId обязателен: без него невозможна идемпотентность ---
+  if (!eventId || typeof eventId !== "string") {
+    return res.status(400).json({
+      ok: false,
+      error: "Bad eventId",
+    });
+  }
+
+  // --- Шаг 4. Идемпотентность: повторный перевод не зачисляется дважды ---
+  //
+  // Проверка и последующая отметка выполняются синхронно, без await
+  // между ними: Node однопоточен, поэтому два одинаковых запроса
+  // физически не могут одновременно пройти проверку до вставки —
+  // гонки нет, отдельная транзакция не требуется.
+  if (isEventProcessed(eventId)) {
+    const existing = getUser(nickname);
+
+    console.log("[PAYMENT] Дубликат пропущен:", { eventId, nickname });
+
+    return res.json({
+      ok: true,
+      duplicate: true,
+      created: false,
+      nickname: existing ? existing.nickname : nickname,
+      balance: existing ? existing.balance : 0,
+      password: null,
+      tellMessage: null,
     });
   }
 
@@ -825,6 +901,17 @@ app.post("/api/minecraft/payment", (req, res) => {
   // Начисление одной атомарной операцией в БД
   applyPayment(user.nickname, parsedAmount);
 
+  // Журнал платежей: каждый ПРИНЯТЫЙ перевод фиксируется в таблице
+  // payments вместе с исходным текстом чата — по нему можно разбирать
+  // спорные случаи («перевод был, а баланса нет»)
+  markEventProcessed({
+    eventId,
+    nickname: user.nickname,
+    amount: parsedAmount,
+    currency,
+    rawMessage,
+  });
+
   // Перечитываем актуальные баланс и данные
   user = getUser(nickname);
 
@@ -844,6 +931,7 @@ app.post("/api/minecraft/payment", (req, res) => {
 
   return res.json({
     ok: true,
+    duplicate: false,
     created,
     nickname: user.nickname,
     balance: user.balance,
